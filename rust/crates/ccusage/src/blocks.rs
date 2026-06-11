@@ -548,7 +548,7 @@ pub(crate) fn calculate_burn_rate(block: &SessionBlock) -> Option<BurnRate> {
     })
 }
 
-fn project_block_usage(block: &SessionBlock) -> Option<Projection> {
+pub(crate) fn project_block_usage(block: &SessionBlock) -> Option<Projection> {
     if !block.is_active || block.is_gap {
         return None;
     }
