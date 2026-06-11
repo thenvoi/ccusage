@@ -2,6 +2,7 @@
 name = "ccusage-test-support"
 version = "20.0.17"
 edition = "2024"
+license = "MIT"
 publish = false
 
 [dependencies]

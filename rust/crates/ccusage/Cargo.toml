@@ -2,6 +2,7 @@
 name = "ccusage"
 version = "20.0.17"
 edition = "2024"
+license = "MIT"
 build = "build.rs"
 
 [[bin]]

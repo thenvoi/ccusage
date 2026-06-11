@@ -2,6 +2,7 @@
 name = "ccusage-terminal"
 version = "20.0.17"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 terminal_size = "0.4.4"
