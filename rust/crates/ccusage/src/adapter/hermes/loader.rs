@@ -2,8 +2,10 @@ use std::{collections::HashSet, path::Path};
 
 use crate::{cli::SharedArgs, LoadedEntry, PricingMap, Result};
 
+#[cfg(feature = "sqlite-adapters")]
+use super::parser::read_session_row;
 use super::{
-    parser::{read_session_row, to_loaded_entry, HermesEntry},
+    parser::{to_loaded_entry, HermesEntry},
     paths::hermes_state_db_paths,
 };
 
@@ -29,6 +31,7 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
     Ok(entries)
 }
 
+#[cfg(feature = "sqlite-adapters")]
 fn load_state_db_entries(db_path: &Path, shared: &SharedArgs) -> Vec<HermesEntry> {
     let Ok(connection) =
         sqlite::Connection::open_with_flags(db_path, sqlite::OpenFlags::new().with_read_only())
@@ -95,7 +98,19 @@ fn load_state_db_entries(db_path: &Path, shared: &SharedArgs) -> Vec<HermesEntry
     entries
 }
 
-#[cfg(test)]
+#[cfg(not(feature = "sqlite-adapters"))]
+fn load_state_db_entries(db_path: &Path, shared: &SharedArgs) -> Vec<HermesEntry> {
+    crate::debug_log(
+        shared,
+        format!(
+            "Hermes database support is disabled in this build (sqlite-adapters feature off): {}",
+            db_path.display()
+        ),
+    );
+    Vec::new()
+}
+
+#[cfg(all(test, feature = "sqlite-adapters"))]
 mod tests {
     use std::path::Path;
 

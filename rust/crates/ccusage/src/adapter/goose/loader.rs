@@ -4,7 +4,9 @@ use jiff::tz::TimeZone as JiffTimeZone;
 
 use crate::{cli::SharedArgs, debug_log, parse_tz, LoadedEntry, PricingMap, Result};
 
-use super::{parser::row_to_entry, paths::goose_db_paths};
+#[cfg(feature = "sqlite-adapters")]
+use super::parser::row_to_entry;
+use super::paths::goose_db_paths;
 
 const GOOSE_SESSION_QUERY: &str = r#"
 SELECT
@@ -45,6 +47,7 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
     Ok(entries)
 }
 
+#[cfg(feature = "sqlite-adapters")]
 fn load_entries_from_db(
     db_path: &Path,
     tz: Option<&JiffTimeZone>,
@@ -89,7 +92,24 @@ fn load_entries_from_db(
     Ok(entries)
 }
 
-#[cfg(test)]
+#[cfg(not(feature = "sqlite-adapters"))]
+fn load_entries_from_db(
+    db_path: &Path,
+    _tz: Option<&JiffTimeZone>,
+    _pricing: &PricingMap,
+    shared: &SharedArgs,
+) -> Result<Vec<LoadedEntry>> {
+    debug_log(
+        shared,
+        format!(
+            "Goose database support is disabled in this build (sqlite-adapters feature off): {}",
+            db_path.display()
+        ),
+    );
+    Ok(Vec::new())
+}
+
+#[cfg(all(test, feature = "sqlite-adapters"))]
 mod tests {
     use std::path::Path;
 

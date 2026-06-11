@@ -37,6 +37,7 @@ fn load_entries_inner(shared: &SharedArgs, pricing: &PricingMap) -> Result<Vec<L
     Ok(entries)
 }
 
+#[cfg(feature = "sqlite-adapters")]
 fn load_entries_from_database(
     db_path: &Path,
     tz: Option<&JiffTimeZone>,
@@ -100,7 +101,24 @@ fn load_entries_from_database(
     entries
 }
 
-#[cfg(test)]
+#[cfg(not(feature = "sqlite-adapters"))]
+fn load_entries_from_database(
+    db_path: &Path,
+    _tz: Option<&JiffTimeZone>,
+    shared: &SharedArgs,
+    _pricing: &PricingMap,
+) -> Vec<LoadedEntry> {
+    debug_log(
+        shared,
+        format!(
+            "Kilo database support is disabled in this build (sqlite-adapters feature off): {}",
+            db_path.display()
+        ),
+    );
+    Vec::new()
+}
+
+#[cfg(all(test, feature = "sqlite-adapters"))]
 mod tests {
     use std::{env, path::Path, sync::Mutex};
 

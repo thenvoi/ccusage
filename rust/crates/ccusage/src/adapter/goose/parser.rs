@@ -8,6 +8,7 @@ use crate::{
     LoadedEntry, PricingMap, TokenUsageRaw, UsageEntry, UsageMessage,
 };
 
+#[cfg(feature = "sqlite-adapters")]
 pub(super) fn row_to_entry(
     statement: &sqlite::Statement<'_>,
     tz: Option<&JiffTimeZone>,
@@ -79,6 +80,7 @@ pub(super) fn row_to_entry(
     })
 }
 
+#[cfg(feature = "sqlite-adapters")]
 fn read_token_value(statement: &sqlite::Statement<'_>, index: usize) -> Option<u64> {
     statement
         .read::<i64, _>(index)
@@ -87,6 +89,7 @@ fn read_token_value(statement: &sqlite::Statement<'_>, index: usize) -> Option<u
         .map(|value| value as u64)
 }
 
+#[cfg(feature = "sqlite-adapters")]
 fn read_timestamp_value(statement: &sqlite::Statement<'_>, index: usize) -> Option<String> {
     statement.read::<String, _>(index).ok().or_else(|| {
         statement
