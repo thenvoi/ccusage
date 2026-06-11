@@ -12,13 +12,15 @@
 //! explicitly-set `CLAUDE_CONFIG_DIR` with no valid entries is an error
 //! (mirroring the CLI).
 
+use std::path::PathBuf;
+
 use crate::{
+    adapter::claude::{load_daily_summaries_in, load_entries_in},
     calculate_burn_rate,
     cli::{normalize_date_bound, CostMode, SharedArgs, SortOrder, WeekDay},
-    filter_and_sort_summaries, filter_blocks_by_date, identify_session_blocks,
-    load_daily_summaries, load_entries, sort_blocks, sort_summaries, summarize_by_key,
-    summarize_summaries_by_bucket, BucketKind, ModelBreakdown, Result, SessionAccumulator,
-    SessionBlock, UsageSummary, DEFAULT_SESSION_DURATION_HOURS,
+    filter_and_sort_summaries, filter_blocks_by_date, identify_session_blocks, sort_blocks,
+    sort_summaries, summarize_by_key, summarize_summaries_by_bucket, BucketKind, ModelBreakdown,
+    Result, SessionAccumulator, SessionBlock, UsageSummary, DEFAULT_SESSION_DURATION_HOURS,
 };
 
 /// How costs are derived from usage entries.
@@ -47,6 +49,11 @@ pub struct UsageOptions {
     pub timezone: Option<String>,
     /// Cost derivation mode.
     pub cost_basis: CostBasis,
+    /// Explicit Claude config directories (each containing `projects/`),
+    /// overriding `CLAUDE_CONFIG_DIR` / home discovery. Like the env var,
+    /// entries without a `projects/` subdirectory are skipped and an
+    /// override with no valid entries is an error.
+    pub claude_dirs: Option<Vec<PathBuf>>,
 }
 
 /// Per-model usage within a report row.
@@ -152,6 +159,23 @@ fn shared_args(opts: &UsageOptions) -> SharedArgs {
     }
 }
 
+fn resolve_dirs(opts: &UsageOptions) -> Result<Option<Vec<PathBuf>>> {
+    let Some(dirs) = &opts.claude_dirs else {
+        return Ok(None);
+    };
+    let valid: Vec<PathBuf> = dirs
+        .iter()
+        .filter(|dir| dir.join("projects").is_dir())
+        .cloned()
+        .collect();
+    if valid.is_empty() {
+        return Err(crate::cli_error(
+            "no valid Claude data directories in claude_dirs (each must contain projects/)",
+        ));
+    }
+    Ok(Some(valid))
+}
+
 fn model_usage(b: &ModelBreakdown) -> ModelUsage {
     ModelUsage {
         model: b.model_name.clone(),
@@ -179,7 +203,8 @@ fn period_usage(row: &UsageSummary, period: String) -> PeriodUsage {
 /// Daily Claude Code usage, one row per date (in the configured timezone).
 pub fn claude_daily(opts: &UsageOptions) -> Result<Vec<PeriodUsage>> {
     let shared = shared_args(opts);
-    let mut rows = load_daily_summaries(&shared, None, false)?;
+    let dirs = resolve_dirs(opts)?;
+    let mut rows = load_daily_summaries_in(&shared, None, false, dirs.as_deref())?;
     filter_and_sort_summaries(&mut rows, &shared, |row| {
         row.date.as_deref().unwrap_or_default()
     });
@@ -193,7 +218,8 @@ pub fn claude_daily(opts: &UsageOptions) -> Result<Vec<PeriodUsage>> {
 /// default is Sunday) and are keyed by the week's start date.
 pub fn claude_weekly(opts: &UsageOptions, week_starts_on: WeekDay) -> Result<Vec<PeriodUsage>> {
     let shared = shared_args(opts);
-    let entries = load_entries(&shared, None)?;
+    let dirs = resolve_dirs(opts)?;
+    let entries = load_entries_in(&shared, None, dirs.as_deref())?;
     let mut daily = summarize_by_key(
         &entries,
         |entry| entry.date.clone(),
@@ -215,7 +241,8 @@ pub fn claude_weekly(opts: &UsageOptions, week_starts_on: WeekDay) -> Result<Vec
 /// Monthly Claude Code usage, keyed `YYYY-MM`.
 pub fn claude_monthly(opts: &UsageOptions) -> Result<Vec<PeriodUsage>> {
     let shared = shared_args(opts);
-    let entries = load_entries(&shared, None)?;
+    let dirs = resolve_dirs(opts)?;
+    let entries = load_entries_in(&shared, None, dirs.as_deref())?;
     let mut daily = summarize_by_key(
         &entries,
         |entry| entry.date.clone(),
@@ -242,7 +269,8 @@ pub fn claude_sessions(opts: &UsageOptions) -> Result<Vec<SessionUsage>> {
     use std::sync::Arc;
 
     let shared = shared_args(opts);
-    let entries = load_entries(&shared, None)?;
+    let dirs = resolve_dirs(opts)?;
+    let entries = load_entries_in(&shared, None, dirs.as_deref())?;
     let mut grouped = Vec::<SessionAccumulator>::new();
     let mut group_indexes = FxHashMap::<(Arc<str>, Arc<str>), usize>::default();
     for entry in &entries {
@@ -307,7 +335,8 @@ pub fn claude_blocks(
         return Err(crate::cli_error("session_hours must be positive"));
     }
     let shared = shared_args(opts);
-    let entries = load_entries(&shared, None)?;
+    let dirs = resolve_dirs(opts)?;
+    let entries = load_entries_in(&shared, None, dirs.as_deref())?;
     let mut blocks = identify_session_blocks(entries, session_hours);
     filter_blocks_by_date(&mut blocks, &shared);
     sort_blocks(&mut blocks, &shared.order);
@@ -345,25 +374,15 @@ fn block_usage(block: &SessionBlock) -> BlockUsage {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, sync::Mutex};
-
     use ccusage_test_support::fs_fixture;
 
     use super::*;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_claude_dir<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = env::var("CLAUDE_CONFIG_DIR").ok();
-        env::set_var("CLAUDE_CONFIG_DIR", root);
-        let result = f();
-        if let Some(previous) = previous {
-            env::set_var("CLAUDE_CONFIG_DIR", previous);
-        } else {
-            env::remove_var("CLAUDE_CONFIG_DIR");
+    fn in_dir(root: &std::path::Path) -> UsageOptions {
+        UsageOptions {
+            claude_dirs: Some(vec![root.to_path_buf()]),
+            ..options()
         }
-        result
     }
 
     fn entry(ts: &str, msg: &str, req: &str, model: &str, input: u64, cost: f64) -> String {
@@ -390,7 +409,7 @@ mod tests {
             ].join("\n"),
         });
 
-        let rows = with_claude_dir(fixture.root(), || claude_daily(&options())).unwrap();
+        let rows = claude_daily(&in_dir(fixture.root())).unwrap();
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].period, "2026-01-10");
@@ -411,7 +430,7 @@ mod tests {
                 entry("2026-01-10T10:05:00.000Z", "m2", "r2", "claude-opus-4-6", 40, 0.2),
         });
 
-        let rows = with_claude_dir(fixture.root(), || claude_sessions(&options())).unwrap();
+        let rows = claude_sessions(&in_dir(fixture.root())).unwrap();
 
         assert_eq!(rows.len(), 1, "subagent log must merge into its parent");
         assert_eq!(rows[0].session_id, session);
@@ -433,8 +452,7 @@ mod tests {
             ].join("\n"),
         });
 
-        let blocks =
-            with_claude_dir(fixture.root(), || claude_blocks(&options(), 5.0, false)).unwrap();
+        let blocks = claude_blocks(&in_dir(fixture.root()), 5.0, false).unwrap();
 
         let real: Vec<_> = blocks.iter().filter(|b| !b.is_gap).collect();
         let gaps: Vec<_> = blocks.iter().filter(|b| b.is_gap).collect();
@@ -442,24 +460,20 @@ mod tests {
         assert_eq!(gaps.len(), 1);
         assert!(blocks.iter().all(|b| !b.is_active));
 
-        let active =
-            with_claude_dir(fixture.root(), || claude_blocks(&options(), 5.0, true)).unwrap();
+        let active = claude_blocks(&in_dir(fixture.root()), 5.0, true).unwrap();
         assert!(active.is_empty());
     }
 
     #[test]
     fn missing_data_dirs_yield_empty_reports_without_env() {
-        // No CLAUDE_CONFIG_DIR override: point HOME-style discovery at an
-        // empty fixture by setting the env to a dir WITH a projects/ subdir
-        // but no logs at all.
+        // A valid data dir (has projects/) with no logs yields empty reports.
         let fixture = fs_fixture!({
             "projects/.keep": "",
         });
 
-        let daily = with_claude_dir(fixture.root(), || claude_daily(&options())).unwrap();
-        let sessions = with_claude_dir(fixture.root(), || claude_sessions(&options())).unwrap();
-        let blocks =
-            with_claude_dir(fixture.root(), || claude_blocks(&options(), 5.0, false)).unwrap();
+        let daily = claude_daily(&in_dir(fixture.root())).unwrap();
+        let sessions = claude_sessions(&in_dir(fixture.root())).unwrap();
+        let blocks = claude_blocks(&in_dir(fixture.root()), 5.0, false).unwrap();
 
         assert!(daily.is_empty());
         assert!(sessions.is_empty());
@@ -472,7 +486,7 @@ mod tests {
             "not-projects/.keep": "",
         });
 
-        let result = with_claude_dir(fixture.root(), || claude_daily(&options()));
+        let result = claude_daily(&in_dir(fixture.root()));
 
         assert!(result.is_err(), "explicit bad CLAUDE_CONFIG_DIR must error");
     }
@@ -489,10 +503,10 @@ mod tests {
         let opts = UsageOptions {
             since: Some("2026-01-10".to_string()),
             until: Some("2026-01-10".to_string()),
-            ..options()
+            ..in_dir(fixture.root())
         };
 
-        let rows = with_claude_dir(fixture.root(), || claude_daily(&opts)).unwrap();
+        let rows = claude_daily(&opts).unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].period, "2026-01-10");

@@ -35,8 +35,18 @@ pub(crate) fn load_entries(
     shared: &SharedArgs,
     project_filter: Option<&str>,
 ) -> Result<Vec<LoadedEntry>> {
+    load_entries_in(shared, project_filter, None)
+}
+
+/// Like [`load_entries`], but scanning `paths_override` (Claude config dirs,
+/// each containing `projects/`) instead of the default discovery.
+pub(crate) fn load_entries_in(
+    shared: &SharedArgs,
+    project_filter: Option<&str>,
+    paths_override: Option<&[PathBuf]>,
+) -> Result<Vec<LoadedEntry>> {
     progress::track_usage_load(progress::UsageLoadAgent::Claude, shared.json, || {
-        load_entries_inner(shared, project_filter)
+        load_entries_inner(shared, project_filter, paths_override)
     })
 }
 
@@ -45,16 +55,30 @@ pub(crate) fn load_daily_summaries(
     project_filter: Option<&str>,
     group_by_project: bool,
 ) -> Result<Vec<UsageSummary>> {
+    load_daily_summaries_in(shared, project_filter, group_by_project, None)
+}
+
+/// Like [`load_daily_summaries`], with an explicit data-directory override.
+pub(crate) fn load_daily_summaries_in(
+    shared: &SharedArgs,
+    project_filter: Option<&str>,
+    group_by_project: bool,
+    paths_override: Option<&[PathBuf]>,
+) -> Result<Vec<UsageSummary>> {
     progress::track_usage_load(progress::UsageLoadAgent::Claude, shared.json, || {
-        daily::load_daily_summaries_inner(shared, project_filter, group_by_project)
+        daily::load_daily_summaries_inner(shared, project_filter, group_by_project, paths_override)
     })
 }
 
 fn load_entries_inner(
     shared: &SharedArgs,
     project_filter: Option<&str>,
+    paths_override: Option<&[PathBuf]>,
 ) -> Result<Vec<LoadedEntry>> {
-    let paths = claude_paths()?;
+    let paths = match paths_override {
+        Some(paths) => paths.to_vec(),
+        None => claude_paths()?,
+    };
     debug_log(
         shared,
         format!(
