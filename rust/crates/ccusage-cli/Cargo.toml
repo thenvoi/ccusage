@@ -2,6 +2,7 @@
 name = "ccusage-cli"
 version = "20.0.11"
 edition = "2021"
+license = "MIT"
 build = "build.rs"
 
 [dependencies]
