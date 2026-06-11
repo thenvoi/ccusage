@@ -214,9 +214,37 @@ pub fn claude_daily(opts: &UsageOptions) -> Result<Vec<PeriodUsage>> {
         .collect())
 }
 
+/// First day of the week for weekly grouping.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WeekStart {
+    /// The CLI default.
+    #[default]
+    Sunday,
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+}
+
+impl WeekStart {
+    fn week_day(self) -> WeekDay {
+        match self {
+            WeekStart::Sunday => WeekDay::Sunday,
+            WeekStart::Monday => WeekDay::Monday,
+            WeekStart::Tuesday => WeekDay::Tuesday,
+            WeekStart::Wednesday => WeekDay::Wednesday,
+            WeekStart::Thursday => WeekDay::Thursday,
+            WeekStart::Friday => WeekDay::Friday,
+            WeekStart::Saturday => WeekDay::Saturday,
+        }
+    }
+}
+
 /// Weekly Claude Code usage; weeks start on `week_starts_on` (the CLI
 /// default is Sunday) and are keyed by the week's start date.
-pub fn claude_weekly(opts: &UsageOptions, week_starts_on: WeekDay) -> Result<Vec<PeriodUsage>> {
+pub fn claude_weekly(opts: &UsageOptions, week_starts_on: WeekStart) -> Result<Vec<PeriodUsage>> {
     let shared = shared_args(opts);
     let dirs = resolve_dirs(opts)?;
     let entries = load_entries_in(&shared, None, dirs.as_deref())?;
@@ -228,7 +256,8 @@ pub fn claude_weekly(opts: &UsageOptions, week_starts_on: WeekDay) -> Result<Vec
     filter_and_sort_summaries(&mut daily, &shared, |row| {
         row.date.as_deref().unwrap_or_default()
     });
-    let mut weekly = summarize_summaries_by_bucket(&daily, BucketKind::Weekly, week_starts_on);
+    let mut weekly =
+        summarize_summaries_by_bucket(&daily, BucketKind::Weekly, week_starts_on.week_day());
     sort_summaries(&mut weekly, &shared.order, |row| {
         row.week.as_deref().unwrap_or_default()
     });
