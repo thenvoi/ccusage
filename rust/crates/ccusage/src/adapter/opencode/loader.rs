@@ -135,6 +135,7 @@ fn is_channel_db_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
+#[cfg(feature = "sqlite-adapters")]
 fn load_entries_from_database(
     db_path: &Path,
     tz: Option<&JiffTimeZone>,
@@ -221,7 +222,25 @@ fn entry_id(entry: &LoadedEntry) -> Option<&str> {
     entry.data.message.id.as_deref().filter(|id| !id.is_empty())
 }
 
-#[cfg(test)]
+#[cfg(not(feature = "sqlite-adapters"))]
+fn load_entries_from_database(
+    db_path: &Path,
+    _tz: Option<&JiffTimeZone>,
+    _mode: CostMode,
+    _pricing: Option<&PricingMap>,
+    shared: &SharedArgs,
+) -> Vec<LoadedEntry> {
+    debug_log(
+        shared,
+        format!(
+            "OpenCode database support is disabled in this build (sqlite-adapters feature off): {}",
+            db_path.display()
+        ),
+    );
+    Vec::new()
+}
+
+#[cfg(all(test, feature = "sqlite-adapters"))]
 mod tests {
     use std::path::Path;
 

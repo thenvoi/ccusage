@@ -12,6 +12,13 @@ path = "src/main.rs"
 name = "generate-config-schema"
 path = "src/bin/generate_config_schema.rs"
 
+[features]
+default = ["sqlite-adapters"]
+# Adapters that read agent-local SQLite databases (OpenCode, Kilo, Hermes,
+# Goose). Disable to drop the bundled SQLite dependency when embedding the
+# library; those agents then report no usage.
+sqlite-adapters = ["dep:sqlite"]
+
 [dependencies]
 ccusage-cli = { path = "../ccusage-cli" }
 ccusage-terminal = { path = "../ccusage-terminal" }
@@ -28,7 +35,7 @@ schemars = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
-sqlite = { version = "0.37.0", default-features = false, features = ["bundled", "linkage"] }
+sqlite = { version = "0.37.0", default-features = false, features = ["bundled", "linkage"], optional = true }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
 [build-dependencies]

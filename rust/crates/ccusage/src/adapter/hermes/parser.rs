@@ -20,6 +20,7 @@ pub(super) struct HermesEntry {
     cost_usd: Option<f64>,
 }
 
+#[cfg(feature = "sqlite-adapters")]
 pub(super) fn read_session_row(statement: &sqlite::Statement<'_>) -> Option<HermesEntry> {
     let session_id = statement.read::<String, _>(0).ok()?;
     let model = statement.read::<String, _>(1).ok()?.trim().to_string();
@@ -67,6 +68,7 @@ pub(super) fn read_session_row(statement: &sqlite::Statement<'_>) -> Option<Herm
     })
 }
 
+#[cfg(feature = "sqlite-adapters")]
 fn read_u64(statement: &sqlite::Statement<'_>, index: usize) -> u64 {
     statement
         .read::<i64, _>(index)
@@ -82,6 +84,7 @@ fn read_u64(statement: &sqlite::Statement<'_>, index: usize) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "sqlite-adapters")]
 fn read_f64(statement: &sqlite::Statement<'_>, index: usize) -> Option<f64> {
     statement
         .read::<f64, _>(index)
@@ -95,6 +98,7 @@ fn read_f64(statement: &sqlite::Statement<'_>, index: usize) -> Option<f64> {
         })
 }
 
+#[cfg(feature = "sqlite-adapters")]
 fn read_non_negative_f64(statement: &sqlite::Statement<'_>, index: usize) -> Option<f64> {
     read_f64(statement, index).map(|value| value.max(0.0))
 }
