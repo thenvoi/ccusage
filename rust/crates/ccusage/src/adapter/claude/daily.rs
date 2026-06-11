@@ -29,8 +29,12 @@ pub(super) fn load_daily_summaries_inner(
     shared: &SharedArgs,
     project_filter: Option<&str>,
     group_by_project: bool,
+    paths_override: Option<&[std::path::PathBuf]>,
 ) -> Result<Vec<UsageSummary>> {
-    let paths = claude_paths()?;
+    let paths = match paths_override {
+        Some(paths) => paths.to_vec(),
+        None => claude_paths()?,
+    };
     let files = usage_files(&paths, project_filter);
     if files.is_empty() {
         return Ok(Vec::new());
