@@ -321,9 +321,16 @@ pub fn claude_sessions(opts: &UsageOptions) -> Result<Vec<SessionUsage>> {
     }
     if shared.since.is_some() || shared.until.is_some() {
         rows.retain(|row| {
+            // Compare the DATE PREFIX only. The upstream CLI compares the whole
+            // RFC3339 stamp against the compact date bound lexically, which
+            // silently excludes sessions last active ON the `until` day
+            // ("…0610T12:00…" > "20260610"); bounds here are documented
+            // inclusive, so a session on the boundary day must stay.
             let date = row
                 .last_activity
                 .as_deref()
+                .unwrap_or_default()
+                .get(..10)
                 .unwrap_or_default()
                 .replace('-', "");
             shared.since.as_ref().is_none_or(|since| &date >= since)
@@ -518,6 +525,30 @@ mod tests {
         let result = claude_daily(&in_dir(fixture.root()));
 
         assert!(result.is_err(), "explicit bad CLAUDE_CONFIG_DIR must error");
+    }
+
+    #[test]
+    fn sessions_until_bound_includes_the_boundary_day() {
+        let fixture = fs_fixture!({
+            "projects/proj-a/55555555-5555-4555-8555-555555555555.jsonl":
+                entry("2026-01-10T22:30:00.000Z", "m1", "r1", "claude-opus-4-6", 100, 0.5),
+            "projects/proj-a/66666666-6666-4666-8666-666666666666.jsonl":
+                entry("2026-01-11T08:00:00.000Z", "m2", "r2", "claude-opus-4-6", 10, 0.1),
+        });
+        let opts = UsageOptions {
+            since: Some("2026-01-01".to_string()),
+            until: Some("2026-01-10".to_string()),
+            ..in_dir(fixture.root())
+        };
+
+        let rows = claude_sessions(&opts).unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "a session last active ON the until day is inside the inclusive bound"
+        );
+        assert_eq!(rows[0].session_id, "55555555-5555-4555-8555-555555555555");
     }
 
     #[test]
