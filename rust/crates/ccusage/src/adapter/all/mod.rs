@@ -1,6 +1,6 @@
-mod loader;
+pub(crate) mod loader;
 mod report;
-mod types;
+pub(crate) mod types;
 
 use crate::{cli::AgentCommandArgs, print_json_or_jq, wants_json, Result};
 

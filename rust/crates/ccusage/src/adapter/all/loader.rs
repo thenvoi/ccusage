@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::mpsc, thread};
+use std::{collections::BTreeMap, path::PathBuf, sync::mpsc, thread};
 
 use serde_json::{json, Value};
 
@@ -18,6 +18,14 @@ use super::{
 };
 
 pub(super) fn load_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AllLoadResult> {
+    load_rows_in(kind, shared, None)
+}
+
+pub(crate) fn load_rows_in(
+    kind: AgentReportKind,
+    shared: &SharedArgs,
+    claude_dirs: Option<&[PathBuf]>,
+) -> Result<AllLoadResult> {
     let mut progress = crate::progress::UsageLoadProgress::new(
         crate::log_level() != Some(0)
             && crate::progress::should_show_usage_load_progress(
@@ -46,7 +54,7 @@ pub(super) fn load_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<Al
                 index: 0,
                 agent: "claude",
                 progress_agent: crate::progress::UsageLoadAgent::Claude,
-                load: Box::new(|| load_claude_rows(load_kind, &loader_shared)),
+                load: Box::new(|| load_claude_rows_in(load_kind, &loader_shared, claude_dirs)),
             },
             AgentLoadSpec {
                 index: 1,
@@ -387,9 +395,13 @@ fn load_session_capable_summary_agent_rows(
     })
 }
 
-fn load_claude_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AgentRows> {
+fn load_claude_rows_in(
+    kind: AgentReportKind,
+    shared: &SharedArgs,
+    claude_dirs: Option<&[PathBuf]>,
+) -> Result<AgentRows> {
     if kind == AgentReportKind::Session {
-        let entries = claude::load_entries(shared, None)?;
+        let entries = claude::load_entries_in(shared, None, claude_dirs)?;
         let detected = !entries.is_empty();
         let mut summaries = summarize_entry_sessions(&entries)?;
         filter_session_summaries(&mut summaries, shared);
@@ -399,7 +411,7 @@ fn load_claude_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AgentR
         });
     }
 
-    let mut summaries = claude::load_daily_summaries(shared, None, false)?;
+    let mut summaries = claude::load_daily_summaries_in(shared, None, false, claude_dirs)?;
     let detected = !summaries.is_empty();
     filter_daily_summaries_by_date(&mut summaries, shared);
     Ok(AgentRows {
@@ -507,6 +519,8 @@ fn filter_session_summaries(rows: &mut Vec<UsageSummary>, shared: &SharedArgs) {
             let date = row
                 .last_activity
                 .as_deref()
+                .unwrap_or_default()
+                .get(..10)
                 .unwrap_or_default()
                 .replace('-', "");
             shared.since.as_ref().is_none_or(|since| &date >= since)

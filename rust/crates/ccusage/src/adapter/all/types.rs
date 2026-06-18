@@ -5,25 +5,25 @@ use serde_json::Value;
 use crate::{fast::FxHashMap, ModelBreakdown};
 
 #[derive(Debug, Clone)]
-pub(super) struct AllRow {
-    pub(super) period: String,
-    pub(super) agent: &'static str,
-    pub(super) models_used: Vec<String>,
-    pub(super) input_tokens: u64,
-    pub(super) output_tokens: u64,
-    pub(super) cache_creation_tokens: u64,
-    pub(super) cache_read_tokens: u64,
-    pub(super) total_tokens: u64,
-    pub(super) total_cost: f64,
-    pub(super) metadata: Option<Value>,
-    pub(super) metadata_agents: Option<Vec<&'static str>>,
-    pub(super) agent_breakdowns: Option<Vec<AllRow>>,
-    pub(super) model_breakdowns: Vec<ModelBreakdown>,
+pub(crate) struct AllRow {
+    pub(crate) period: String,
+    pub(crate) agent: &'static str,
+    pub(crate) models_used: Vec<String>,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_creation_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
+    pub(crate) total_tokens: u64,
+    pub(crate) total_cost: f64,
+    pub(crate) metadata: Option<Value>,
+    pub(crate) metadata_agents: Option<Vec<&'static str>>,
+    pub(crate) agent_breakdowns: Option<Vec<AllRow>>,
+    pub(crate) model_breakdowns: Vec<ModelBreakdown>,
 }
 
-pub(super) struct AllLoadResult {
-    pub(super) rows: Vec<AllRow>,
-    pub(super) detected_agents: Vec<&'static str>,
+pub(crate) struct AllLoadResult {
+    pub(crate) rows: Vec<AllRow>,
+    pub(crate) detected_agents: Vec<&'static str>,
 }
 
 pub(super) struct AgentRows {
