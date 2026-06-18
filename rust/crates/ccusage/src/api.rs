@@ -342,7 +342,12 @@ pub fn claude_daily(opts: &UsageOptions) -> Result<Vec<PeriodUsage>> {
 pub fn all_daily(opts: &UsageOptions) -> Result<Vec<AgentPeriodUsage>> {
     let shared = shared_args(opts);
     let dirs = resolve_dirs(opts)?;
-    let rows = load_rows_in(AgentReportKind::Daily, &shared, dirs.as_deref())?;
+    let rows = load_rows_in(
+        AgentReportKind::Daily,
+        &shared,
+        dirs.as_deref(),
+        opts.providers.as_deref(),
+    )?;
     Ok(flatten_agent_rows(rows.rows)
         .iter()
         .filter(|row| provider_allowed(opts, row.agent))
@@ -501,7 +506,12 @@ pub fn claude_sessions(opts: &UsageOptions) -> Result<Vec<SessionUsage>> {
 pub fn all_sessions(opts: &UsageOptions) -> Result<Vec<AgentSessionUsage>> {
     let shared = shared_args(opts);
     let dirs = resolve_dirs(opts)?;
-    let rows = load_rows_in(AgentReportKind::Session, &shared, dirs.as_deref())?;
+    let rows = load_rows_in(
+        AgentReportKind::Session,
+        &shared,
+        dirs.as_deref(),
+        opts.providers.as_deref(),
+    )?;
     Ok(rows
         .rows
         .iter()

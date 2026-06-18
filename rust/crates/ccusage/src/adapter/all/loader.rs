@@ -31,17 +31,18 @@ pub(crate) const BUILT_IN_AGENT_NAMES: &[&str] = &[
 ];
 
 pub(super) fn load_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AllLoadResult> {
-    load_rows_in(kind, shared, None)
+    load_rows_in(kind, shared, None, None)
 }
 
 pub(crate) fn load_rows_in(
     kind: AgentReportKind,
     shared: &SharedArgs,
     claude_dirs: Option<&[PathBuf]>,
+    providers: Option<&[String]>,
 ) -> Result<AllLoadResult> {
     let pricing = load_pricing(shared);
     let load_kind = load_kind_for_report(kind);
-    let loaded = load_base_rows(load_kind, shared, &pricing, claude_dirs)?;
+    let loaded = load_base_rows(load_kind, shared, &pricing, claude_dirs, providers)?;
     Ok(AllLoadResult {
         rows: finish_rows(kind, loaded.rows, shared),
         detected_agents: loaded.detected_agents,
@@ -54,10 +55,10 @@ pub(super) fn load_sections(
 ) -> Result<AllSectionsLoadResult> {
     let pricing = load_pricing(shared);
     let daily_base = needs_daily_family(kinds)
-        .then(|| load_base_rows(AgentReportKind::Daily, shared, &pricing, None))
+        .then(|| load_base_rows(AgentReportKind::Daily, shared, &pricing, None, None))
         .transpose()?;
     let session_base = needs_session(kinds)
-        .then(|| load_base_rows(AgentReportKind::Session, shared, &pricing, None))
+        .then(|| load_base_rows(AgentReportKind::Session, shared, &pricing, None, None))
         .transpose()?;
 
     let daily_detected_agents = daily_base
@@ -114,6 +115,7 @@ fn load_base_rows(
     shared: &SharedArgs,
     pricing: &PricingMap,
     claude_dirs: Option<&[PathBuf]>,
+    providers: Option<&[String]>,
 ) -> Result<AllLoadResult> {
     let mut progress = crate::progress::UsageLoadProgress::new(
         crate::log_level() != Some(0)
@@ -339,6 +341,7 @@ fn load_base_rows(
             }),
         });
     }
+    let specs = filter_agent_specs(specs, providers);
     let loaded = load_agent_rows_parallel(specs, &mut progress)?;
     let mut detected_agents = Vec::new();
     let mut rows = Vec::new();
@@ -354,6 +357,19 @@ fn load_base_rows(
         rows,
         detected_agents,
     })
+}
+
+fn filter_agent_specs<'scope>(
+    specs: Vec<AgentLoadSpec<'scope>>,
+    providers: Option<&[String]>,
+) -> Vec<AgentLoadSpec<'scope>> {
+    let Some(providers) = providers else {
+        return specs;
+    };
+    specs
+        .into_iter()
+        .filter(|spec| providers.iter().any(|provider| provider == spec.agent))
+        .collect()
 }
 
 fn finish_rows(kind: AgentReportKind, mut rows: Vec<AllRow>, shared: &SharedArgs) -> Vec<AllRow> {
@@ -1378,5 +1394,28 @@ mod tests {
                 ("pi", ["[pi] gpt-5".to_string()].as_slice()),
             ]
         );
+    }
+
+    #[test]
+    fn provider_filter_removes_unselected_loader_specs_before_loading() {
+        fn spec(index: usize, agent: &'static str) -> AgentLoadSpec<'static> {
+            AgentLoadSpec {
+                index,
+                agent,
+                progress_agent: crate::progress::UsageLoadAgent::Claude,
+                load: Box::new(|| {
+                    Ok(AgentRows {
+                        rows: Vec::new(),
+                        detected: false,
+                    })
+                }),
+            }
+        }
+
+        let specs = vec![spec(0, "claude"), spec(1, "codex"), spec(2, "opencode")];
+        let filtered = filter_agent_specs(specs, Some(&["codex".to_string()]));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].agent, "codex");
     }
 }
