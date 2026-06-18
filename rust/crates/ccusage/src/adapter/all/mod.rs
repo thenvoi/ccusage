@@ -1,6 +1,6 @@
-mod loader;
+pub(crate) mod loader;
 mod report;
-mod types;
+pub(crate) mod types;
 
 use crate::{
     Result,

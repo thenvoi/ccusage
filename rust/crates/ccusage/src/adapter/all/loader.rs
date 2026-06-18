@@ -31,9 +31,17 @@ pub(crate) const BUILT_IN_AGENT_NAMES: &[&str] = &[
 ];
 
 pub(super) fn load_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AllLoadResult> {
+    load_rows_in(kind, shared, None)
+}
+
+pub(crate) fn load_rows_in(
+    kind: AgentReportKind,
+    shared: &SharedArgs,
+    claude_dirs: Option<&[PathBuf]>,
+) -> Result<AllLoadResult> {
     let pricing = load_pricing(shared);
     let load_kind = load_kind_for_report(kind);
-    let loaded = load_base_rows(load_kind, shared, &pricing)?;
+    let loaded = load_base_rows(load_kind, shared, &pricing, claude_dirs)?;
     Ok(AllLoadResult {
         rows: finish_rows(kind, loaded.rows, shared),
         detected_agents: loaded.detected_agents,
@@ -46,10 +54,10 @@ pub(super) fn load_sections(
 ) -> Result<AllSectionsLoadResult> {
     let pricing = load_pricing(shared);
     let daily_base = needs_daily_family(kinds)
-        .then(|| load_base_rows(AgentReportKind::Daily, shared, &pricing))
+        .then(|| load_base_rows(AgentReportKind::Daily, shared, &pricing, None))
         .transpose()?;
     let session_base = needs_session(kinds)
-        .then(|| load_base_rows(AgentReportKind::Session, shared, &pricing))
+        .then(|| load_base_rows(AgentReportKind::Session, shared, &pricing, None))
         .transpose()?;
 
     let daily_detected_agents = daily_base
@@ -105,6 +113,7 @@ fn load_base_rows(
     load_kind: AgentReportKind,
     shared: &SharedArgs,
     pricing: &PricingMap,
+    claude_dirs: Option<&[PathBuf]>,
 ) -> Result<AllLoadResult> {
     let mut progress = crate::progress::UsageLoadProgress::new(
         crate::log_level() != Some(0)
@@ -122,7 +131,7 @@ fn load_base_rows(
             index: 0,
             agent: BUILT_IN_AGENT_NAMES[0],
             progress_agent: crate::progress::UsageLoadAgent::Claude,
-            load: Box::new(|| load_claude_rows(load_kind, &loader_shared)),
+            load: Box::new(|| load_claude_rows_in(load_kind, &loader_shared, claude_dirs)),
         },
         AgentLoadSpec {
             index: 1,
@@ -572,9 +581,13 @@ fn filtered_pi_format_agent_rows(
     })
 }
 
-fn load_claude_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AgentRows> {
+fn load_claude_rows_in(
+    kind: AgentReportKind,
+    shared: &SharedArgs,
+    claude_dirs: Option<&[PathBuf]>,
+) -> Result<AgentRows> {
     if kind == AgentReportKind::Session {
-        let entries = claude::load_entries(shared, None)?;
+        let entries = claude::load_entries_in(shared, None, claude_dirs)?;
         let detected = !entries.is_empty();
         let mut summaries = summarize_entry_sessions(&entries)?;
         filter_session_summaries(&mut summaries, shared);
@@ -584,7 +597,7 @@ fn load_claude_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AgentR
         });
     }
 
-    let mut summaries = claude::load_daily_summaries(shared, None, false)?;
+    let mut summaries = claude::load_daily_summaries_in(shared, None, false, claude_dirs)?;
     let detected = !summaries.is_empty();
     filter_daily_summaries_by_date(&mut summaries, shared);
     Ok(AgentRows {
@@ -700,6 +713,8 @@ fn filter_session_summaries(rows: &mut Vec<UsageSummary>, shared: &SharedArgs) {
             let date = row
                 .last_activity
                 .as_deref()
+                .unwrap_or_default()
+                .get(..10)
                 .unwrap_or_default()
                 .replace('-', "");
             shared.since.as_ref().is_none_or(|since| &date >= since)

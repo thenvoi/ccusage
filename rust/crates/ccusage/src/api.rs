@@ -6,18 +6,22 @@
 //! deliberately decoupled from the crate's internal types so embedders never
 //! depend on internals.
 //!
-//! Data directories resolve exactly like the CLI: `CLAUDE_CONFIG_DIR`
-//! (comma-separated) when set, else `$XDG_CONFIG_HOME/claude` and
-//! `~/.claude`. Missing directories yield empty reports, not errors; an
+//! Claude-specific functions resolve data directories exactly like the CLI:
+//! `CLAUDE_CONFIG_DIR` (comma-separated) when set, else `$XDG_CONFIG_HOME/claude`
+//! and `~/.claude`. Missing directories yield empty reports, not errors; an
 //! explicitly-set `CLAUDE_CONFIG_DIR` with no valid entries is an error
-//! (mirroring the CLI).
+//! (mirroring the CLI). All-provider functions scan every supported adapter;
+//! `UsageOptions::claude_dirs` only overrides Claude Code discovery.
 
 use std::path::PathBuf;
 
 use crate::{
-    adapter::claude::{load_daily_summaries_in, load_entries_in},
+    adapter::{
+        all::{loader::load_rows_in, types::AllRow},
+        claude::{load_daily_summaries_in, load_entries_in},
+    },
     calculate_burn_rate,
-    cli::{normalize_date_bound, CostMode, SharedArgs, SortOrder, WeekDay},
+    cli::{normalize_date_bound, AgentReportKind, CostMode, SharedArgs, SortOrder, WeekDay},
     filter_and_sort_summaries, filter_blocks_by_date, identify_session_blocks, sort_blocks,
     sort_summaries, summarize_by_key, summarize_summaries_by_bucket, BucketKind, ModelBreakdown,
     Result, SessionAccumulator, SessionBlock, UsageSummary, DEFAULT_SESSION_DURATION_HOURS,
@@ -97,6 +101,53 @@ pub struct SessionUsage {
     pub total_cost: f64,
     pub models: Vec<ModelUsage>,
     /// RFC3339 milliseconds, e.g. `2026-06-11T09:00:00.000Z`.
+    pub first_activity: Option<String>,
+    pub last_activity: Option<String>,
+}
+
+/// Per-model usage within an all-provider report row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentModelUsage {
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost: f64,
+    /// True when no pricing was found for this model (its cost may be 0).
+    pub missing_pricing: bool,
+}
+
+/// One provider-specific row of an all-provider daily report.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentPeriodUsage {
+    /// Provider/adapter key, e.g. `claude`, `codex`, or `opencode`.
+    pub provider: String,
+    /// The grouping key: a date (`2026-06-11`).
+    pub period: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_cost: f64,
+    pub models: Vec<AgentModelUsage>,
+}
+
+/// One provider-specific session row from the all-provider scan.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentSessionUsage {
+    /// Provider/adapter key, e.g. `claude`, `codex`, or `opencode`.
+    pub provider: String,
+    pub session_id: String,
+    pub project_path: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_cost: f64,
+    pub models: Vec<AgentModelUsage>,
+    /// RFC3339 milliseconds when the adapter exposes it.
     pub first_activity: Option<String>,
     pub last_activity: Option<String>,
 }
@@ -200,6 +251,67 @@ fn period_usage(row: &UsageSummary, period: String) -> PeriodUsage {
     }
 }
 
+fn agent_model_usage(provider: &str, b: &ModelBreakdown) -> AgentModelUsage {
+    AgentModelUsage {
+        provider: provider.to_string(),
+        model: b.model_name.clone(),
+        input_tokens: b.input_tokens,
+        output_tokens: b.output_tokens,
+        cache_creation_tokens: b.cache_creation_tokens,
+        cache_read_tokens: b.cache_read_tokens,
+        cost: b.cost,
+        missing_pricing: b.missing_pricing,
+    }
+}
+
+fn agent_period_usage(row: &AllRow) -> AgentPeriodUsage {
+    AgentPeriodUsage {
+        provider: row.agent.to_string(),
+        period: row.period.clone(),
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_creation_tokens: row.cache_creation_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        total_cost: row.total_cost,
+        models: row
+            .model_breakdowns
+            .iter()
+            .map(|b| agent_model_usage(row.agent, b))
+            .collect(),
+    }
+}
+
+fn agent_session_usage(row: &AllRow) -> AgentSessionUsage {
+    AgentSessionUsage {
+        provider: row.agent.to_string(),
+        session_id: row.period.clone(),
+        project_path: metadata_string(row, "projectPath").unwrap_or_default(),
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_creation_tokens: row.cache_creation_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        total_cost: row.total_cost,
+        models: row
+            .model_breakdowns
+            .iter()
+            .map(|b| agent_model_usage(row.agent, b))
+            .collect(),
+        first_activity: metadata_string(row, "firstActivity"),
+        last_activity: metadata_string(row, "lastActivity"),
+    }
+}
+
+fn metadata_string(row: &AllRow, key: &str) -> Option<String> {
+    row.metadata.as_ref()?.get(key)?.as_str().map(str::to_owned)
+}
+
+fn flatten_agent_rows(rows: Vec<AllRow>) -> Vec<AllRow> {
+    rows.into_iter()
+        .flat_map(|mut row| row.agent_breakdowns.take().unwrap_or_else(|| vec![row]))
+        .filter(|row| row.agent != "all")
+        .collect()
+}
+
 /// Daily Claude Code usage, one row per date (in the configured timezone).
 pub fn claude_daily(opts: &UsageOptions) -> Result<Vec<PeriodUsage>> {
     let shared = shared_args(opts);
@@ -211,6 +323,20 @@ pub fn claude_daily(opts: &UsageOptions) -> Result<Vec<PeriodUsage>> {
     Ok(rows
         .iter()
         .map(|row| period_usage(row, row.date.clone().unwrap_or_default()))
+        .collect())
+}
+
+/// Daily usage from every supported local coding-agent adapter, returned as
+/// provider-specific rows. Unlike the CLI's `agent daily` table, rows are not
+/// collapsed into a single `all` provider because embedders usually need to
+/// persist and aggregate by provider.
+pub fn all_daily(opts: &UsageOptions) -> Result<Vec<AgentPeriodUsage>> {
+    let shared = shared_args(opts);
+    let dirs = resolve_dirs(opts)?;
+    let rows = load_rows_in(AgentReportKind::Daily, &shared, dirs.as_deref())?;
+    Ok(flatten_agent_rows(rows.rows)
+        .iter()
+        .map(agent_period_usage)
         .collect())
 }
 
@@ -359,6 +485,16 @@ pub fn claude_sessions(opts: &UsageOptions) -> Result<Vec<SessionUsage>> {
         .collect())
 }
 
+/// Per-session usage from every supported local coding-agent adapter. Session
+/// identifiers are provider-local; consumers should key by `(provider,
+/// session_id)`, not session ID alone.
+pub fn all_sessions(opts: &UsageOptions) -> Result<Vec<AgentSessionUsage>> {
+    let shared = shared_args(opts);
+    let dirs = resolve_dirs(opts)?;
+    let rows = load_rows_in(AgentReportKind::Session, &shared, dirs.as_deref())?;
+    Ok(rows.rows.iter().map(agent_session_usage).collect())
+}
+
 /// Billing blocks (`session_hours`-long windows, gap blocks included),
 /// sorted by start time. With `active_only`, only the currently-active
 /// block (if any) is returned.
@@ -457,6 +593,29 @@ mod tests {
     }
 
     #[test]
+    fn all_daily_returns_provider_rows_not_collapsed_all_rows() {
+        let fixture = fs_fixture!({
+            "projects/proj-a/12121212-1212-4212-8212-121212121212.jsonl": [
+                entry("2026-01-10T10:00:00.000Z", "m1", "r1", "claude-opus-4-6", 100, 0.5),
+                entry("2026-01-10T11:00:00.000Z", "m2", "r2", "claude-opus-4-6", 200, 0.25),
+            ].join("\n"),
+        });
+
+        let rows = all_daily(&in_dir(fixture.root())).unwrap();
+
+        assert!(
+            rows.iter().all(|row| row.provider != "all"),
+            "embedder API must expose provider-specific rows"
+        );
+        let claude: Vec<_> = rows.iter().filter(|row| row.provider == "claude").collect();
+        assert_eq!(claude.len(), 1);
+        assert_eq!(claude[0].period, "2026-01-10");
+        assert_eq!(claude[0].input_tokens, 300);
+        assert!((claude[0].total_cost - 0.75).abs() < f64::EPSILON);
+        assert_eq!(claude[0].models[0].provider, "claude");
+    }
+
+    #[test]
     fn sessions_key_by_jsonl_file_name_and_roll_up_subagents() {
         let session = "22222222-2222-4222-8222-222222222222";
         let fixture = fs_fixture!({
@@ -475,6 +634,29 @@ mod tests {
         assert_eq!(
             rows[0].last_activity.as_deref(),
             Some("2026-01-10T10:05:00.000Z")
+        );
+    }
+
+    #[test]
+    fn all_sessions_return_provider_local_session_rows() {
+        let session = "23232323-2323-4232-8232-232323232323";
+        let fixture = fs_fixture!({
+            "projects/proj-a/23232323-2323-4232-8232-232323232323.jsonl":
+                entry("2026-01-10T10:00:00.000Z", "m1", "r1", "claude-opus-4-6", 100, 0.5),
+        });
+
+        let rows = all_sessions(&in_dir(fixture.root())).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.provider == "claude" && row.session_id == session)
+            .expect("expected Claude session row from explicit fixture");
+
+        assert_eq!(row.input_tokens, 100);
+        assert!((row.total_cost - 0.5).abs() < f64::EPSILON);
+        assert_eq!(row.models[0].provider, "claude");
+        assert_eq!(
+            row.last_activity.as_deref(),
+            Some("2026-01-10T10:00:00.000Z")
         );
     }
 
@@ -549,6 +731,30 @@ mod tests {
             "a session last active ON the until day is inside the inclusive bound"
         );
         assert_eq!(rows[0].session_id, "55555555-5555-4555-8555-555555555555");
+    }
+
+    #[test]
+    fn all_sessions_until_bound_includes_the_boundary_day() {
+        let fixture = fs_fixture!({
+            "projects/proj-a/57575757-5757-4575-8575-575757575757.jsonl":
+                entry("2026-01-10T22:30:00.000Z", "m1", "r1", "claude-opus-4-6", 100, 0.5),
+            "projects/proj-a/68686868-6868-4686-8686-686868686868.jsonl":
+                entry("2026-01-11T08:00:00.000Z", "m2", "r2", "claude-opus-4-6", 10, 0.1),
+        });
+        let opts = UsageOptions {
+            since: Some("2026-01-01".to_string()),
+            until: Some("2026-01-10".to_string()),
+            ..in_dir(fixture.root())
+        };
+
+        let rows = all_sessions(&opts).unwrap();
+        let claude_ids: Vec<_> = rows
+            .iter()
+            .filter(|row| row.provider == "claude")
+            .map(|row| row.session_id.as_str())
+            .collect();
+
+        assert_eq!(claude_ids, vec!["57575757-5757-4575-8575-575757575757"]);
     }
 
     #[test]
