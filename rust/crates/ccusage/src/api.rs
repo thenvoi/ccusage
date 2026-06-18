@@ -58,6 +58,9 @@ pub struct UsageOptions {
     /// entries without a `projects/` subdirectory are skipped and an
     /// override with no valid entries is an error.
     pub claude_dirs: Option<Vec<PathBuf>>,
+    /// Optional all-provider adapter filter for embedders and tests. `None`
+    /// means scan every supported adapter.
+    pub providers: Option<Vec<String>>,
 }
 
 /// Per-model usage within a report row.
@@ -312,6 +315,12 @@ fn flatten_agent_rows(rows: Vec<AllRow>) -> Vec<AllRow> {
         .collect()
 }
 
+fn provider_allowed(opts: &UsageOptions, provider: &str) -> bool {
+    opts.providers
+        .as_ref()
+        .is_none_or(|providers| providers.iter().any(|p| p == provider))
+}
+
 /// Daily Claude Code usage, one row per date (in the configured timezone).
 pub fn claude_daily(opts: &UsageOptions) -> Result<Vec<PeriodUsage>> {
     let shared = shared_args(opts);
@@ -336,6 +345,7 @@ pub fn all_daily(opts: &UsageOptions) -> Result<Vec<AgentPeriodUsage>> {
     let rows = load_rows_in(AgentReportKind::Daily, &shared, dirs.as_deref())?;
     Ok(flatten_agent_rows(rows.rows)
         .iter()
+        .filter(|row| provider_allowed(opts, row.agent))
         .map(agent_period_usage)
         .collect())
 }
@@ -492,7 +502,12 @@ pub fn all_sessions(opts: &UsageOptions) -> Result<Vec<AgentSessionUsage>> {
     let shared = shared_args(opts);
     let dirs = resolve_dirs(opts)?;
     let rows = load_rows_in(AgentReportKind::Session, &shared, dirs.as_deref())?;
-    Ok(rows.rows.iter().map(agent_session_usage).collect())
+    Ok(rows
+        .rows
+        .iter()
+        .filter(|row| provider_allowed(opts, row.agent))
+        .map(agent_session_usage)
+        .collect())
 }
 
 /// Billing blocks (`session_hours`-long windows, gap blocks included),
@@ -613,6 +628,23 @@ mod tests {
         assert_eq!(claude[0].input_tokens, 300);
         assert!((claude[0].total_cost - 0.75).abs() < f64::EPSILON);
         assert_eq!(claude[0].models[0].provider, "claude");
+    }
+
+    #[test]
+    fn all_daily_can_filter_to_named_providers() {
+        let fixture = fs_fixture!({
+            "projects/proj-a/13131313-1313-4313-8313-131313131313.jsonl":
+                entry("2026-01-10T10:00:00.000Z", "m1", "r1", "claude-opus-4-6", 100, 0.5),
+        });
+        let opts = UsageOptions {
+            providers: Some(vec!["claude".to_string()]),
+            ..in_dir(fixture.root())
+        };
+
+        let rows = all_daily(&opts).unwrap();
+
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.provider == "claude"));
     }
 
     #[test]
