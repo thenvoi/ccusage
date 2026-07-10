@@ -1,0 +1,101 @@
+# Keeps the jam library-facade fork from going stale (see FORK-CHANGES.md).
+#
+# thenvoi/tjam consumes this fork rev-pinned via a git dependency, based on one
+# upstream release. Upgrading requires the facade commits rebased onto the newer
+# upstream tag FIRST — this workflow pre-stages that: weekly (and on demand) it
+# fetches upstream, finds the newest v* tag, replays this branch's fork-only
+# commits onto it as `lib-facade-v<X.Y.Z>`, and compile-checks the `ccusage`
+# crate. A clean run means the upgrade branch is ready before anyone needs it; a
+# red run means upstream drifted under the facade and a human must resolve the
+# conflict NOW, not mid-upgrade.
+#
+# Same design as thenvoi/tauri's jam-rebase-patch.yml:
+# - Lives on the fork's DEFAULT branch so the schedule is honored (GitHub keeps
+#   upstream cron workflows disabled in forks).
+# - The patch set is derived, not stored: every commit on this branch that is in
+#   no upstream ref IS the facade, so the replay can't drift from reality.
+name: jam-rebase-facade
+
+on:
+  schedule:
+    - cron: "43 6 * * 1" # weekly, Monday 06:43 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/ccusage/ccusage.git
+          git fetch upstream --tags --quiet
+
+      - name: Plan (newest tag, facade commits, target branch)
+        id: plan
+        run: |
+          set -euo pipefail
+          tag=$(git tag --list 'v*' | sort -V | tail -1)
+          [ -n "$tag" ] || { echo "no v* tags found" >&2; exit 1; }
+          branch="lib-facade-$tag"
+          patches=$(git rev-list --reverse HEAD --not --remotes=upstream)
+          [ -n "$patches" ] || { echo "no facade commits found on $(git branch --show-current)" >&2; exit 1; }
+          {
+            echo "tag=$tag"
+            echo "branch=$branch"
+            echo "patches<<EOF"
+            echo "$patches"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$branch already exists — nothing to do"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Replay the facade onto the tag
+        if: steps.plan.outputs.exists == 'false'
+        env:
+          # Env, not inline ${{ }} interpolation: the list is multiline, and splicing
+          # it into the script would turn every SHA after the first into a stray
+          # shell command (whose failure an `if` condition silently swallows).
+          PATCHES: ${{ steps.plan.outputs.patches }}
+        run: |
+          set -euo pipefail
+          git config user.name "jam-fork-bot"
+          git config user.email "dev@thenvoi.com"
+          git checkout -b "${{ steps.plan.outputs.branch }}" "${{ steps.plan.outputs.tag }}"
+          while IFS= read -r sha; do
+            [ -z "$sha" ] && continue
+            if ! git cherry-pick "$sha"; then
+              echo "::error::$sha no longer applies onto ${{ steps.plan.outputs.tag }} — upstream drifted; rebase by hand and push ${{ steps.plan.outputs.branch }}"
+              exit 1
+            fi
+          done <<< "$PATCHES"
+
+      - name: Compile-check the facade crate
+        if: steps.plan.outputs.exists == 'false'
+        # The build script embeds a pricing snapshot; without CCUSAGE_PRICING_JSON_PATH
+        # it fetches LiteLLM pricing over the network — fine on a CI runner.
+        working-directory: rust
+        run: cargo check -p ccusage
+
+      - name: Push the pre-staged branch
+        if: steps.plan.outputs.exists == 'false'
+        run: |
+          git push origin "${{ steps.plan.outputs.branch }}"
+          {
+            echo "## jam-rebase-facade"
+            echo "Pre-staged \`${{ steps.plan.outputs.branch }}\` at $(git rev-parse HEAD)"
+            echo ""
+            echo "To upgrade tjam: bump the \`ccusage\` rev to that commit, run"
+            echo "\`cargo update -p ccusage\`, refresh the vendored pricing snapshot"
+            echo "(\`just update-pricing\`), and re-exempt any new transitives in cargo-vet."
+          } >> "$GITHUB_STEP_SUMMARY"

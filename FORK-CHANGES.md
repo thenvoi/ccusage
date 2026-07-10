@@ -95,3 +95,14 @@ requirement, not hygiene. Claude/Codex reports don't need those adapters.
   via `CCUSAGE_PRICING_JSON_PATH` to a vendored snapshot (see jam's
   `just update-pricing`). Nothing about that lives in this fork — upstream's
   env-var escape hatch is used as-is.
+
+## Automation: weekly facade rebase (`.github/workflows/jam-rebase-facade.yml`)
+
+Weekly (and via workflow_dispatch), the fork rebases its facade commits onto the
+newest upstream `v*` tag as a pre-staged branch `lib-facade-v<X.Y.Z>`,
+compile-checks the `ccusage` crate, and pushes it. Facade commits are derived
+(`rev-list HEAD --not --remotes=upstream`), never stored as files. A red run =
+upstream drifted under the facade; resolve by hand and push the pre-staged
+branch. Upgrading tjam = bump the `ccusage` rev to the pre-staged head,
+`cargo update -p ccusage`, `just update-pricing`, re-exempt new transitives in
+cargo-vet. (Same design as thenvoi/tauri's `jam-rebase-patch.yml`.)
