@@ -89,6 +89,13 @@ requirement, not hygiene. Claude/Codex reports don't need those adapters.
 - **Rebase cadence:** onto upstream tags quarterly, or immediately when a
   Claude log-format change breaks parsing. The delta is ~6 files of mechanical
   changes plus the self-contained `api.rs`; conflicts should be rare.
+- **Taking an upgrade moves the default branch.** The weekly workflow derives
+  the facade from the DEFAULT branch's history (`rev-list HEAD --not
+  upstream`), so after tjam takes a pre-staged `lib-facade-v<X.Y.Z>` (bumps its
+  rev to it), flip the repo's default branch to that branch. Leaving the old
+  one default makes every future replay start from the stale-structure commits
+  and re-hit the same conflicts (the v20.0.11→v20.0.17 lesson). Never delete or
+  force-push the previous default — tjam's old pins must stay reachable.
 - **Upstreaming:** items marked *upstream PR candidate* above shrink this fork
   when accepted. The lib target itself is also worth proposing.
 - **Pricing snapshot:** the build script embeds LiteLLM pricing; jam pins it
