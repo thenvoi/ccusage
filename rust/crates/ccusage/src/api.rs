@@ -59,6 +59,12 @@ pub struct UsageOptions {
     /// entries without a `projects/` subdirectory are skipped and an
     /// override with no valid entries is an error.
     pub claude_dirs: Option<Vec<PathBuf>>,
+    /// Additional Codex home directories (each normally containing
+    /// `sessions/` and optionally `archived_sessions/`). These are merged with
+    /// `CODEX_HOME` / default-home discovery, allowing embedders to include
+    /// managed provider-state homes without hiding ordinary local sessions or
+    /// mutating process-global environment variables.
+    pub codex_dirs: Option<Vec<PathBuf>>,
     /// Optional all-provider adapter filter for embedders and tests. `None`
     /// means scan every supported adapter.
     pub providers: Option<Vec<String>>,
@@ -355,6 +361,7 @@ pub fn all_daily(opts: &UsageOptions) -> Result<Vec<AgentPeriodUsage>> {
         AgentReportKind::Daily,
         &shared,
         dirs.as_deref(),
+        opts.codex_dirs.as_deref(),
         opts.providers.as_deref(),
     )?;
     Ok(flatten_agent_rows(rows.rows)
@@ -519,6 +526,7 @@ pub fn all_sessions(opts: &UsageOptions) -> Result<Vec<AgentSessionUsage>> {
         AgentReportKind::Session,
         &shared,
         dirs.as_deref(),
+        opts.codex_dirs.as_deref(),
         opts.providers.as_deref(),
     )?;
     Ok(rows
@@ -735,6 +743,37 @@ mod tests {
         let usage = agent_session_usage(&row);
 
         assert_eq!(usage.reasoning_tokens, Some(7));
+    }
+
+    #[test]
+    fn all_sessions_scans_additional_codex_homes_without_mutating_environment() {
+        let session = "00000000-0000-4000-8000-000000000299";
+        let fixture = fs_fixture!({
+            "sessions/2026/07/20/rollout-2026-07-20T10-00-00-00000000-0000-4000-8000-000000000299.jsonl":
+                r#"{"timestamp":"2026-07-20T10:05:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.4","last_token_usage":{"input_tokens":100,"cached_input_tokens":25,"output_tokens":10,"reasoning_output_tokens":7,"total_tokens":117}}}}"#,
+        });
+        let opts = UsageOptions {
+            offline: true,
+            timezone: Some("UTC".into()),
+            providers: Some(vec!["codex".into()]),
+            codex_dirs: Some(vec![fixture.root().to_path_buf()]),
+            ..UsageOptions::default()
+        };
+
+        let rows = all_sessions(&opts).expect("explicit Codex scan");
+        let row = rows
+            .iter()
+            .find(|row| row.provider == "codex" && row.session_id.ends_with(session))
+            .expect("exact fixture session");
+
+        assert_eq!(row.input_tokens, 75);
+        assert_eq!(row.cache_read_tokens, 25);
+        assert_eq!(row.output_tokens, 10);
+        assert_eq!(row.reasoning_tokens, Some(7));
+        assert_eq!(
+            row.last_activity.as_deref(),
+            Some("2026-07-20T10:05:00.000Z")
+        );
     }
 
     #[test]

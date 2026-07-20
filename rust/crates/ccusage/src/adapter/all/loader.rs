@@ -31,18 +31,26 @@ pub(crate) const BUILT_IN_AGENT_NAMES: &[&str] = &[
 ];
 
 pub(super) fn load_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AllLoadResult> {
-    load_rows_in(kind, shared, None, None)
+    load_rows_in(kind, shared, None, None, None)
 }
 
 pub(crate) fn load_rows_in(
     kind: AgentReportKind,
     shared: &SharedArgs,
     claude_dirs: Option<&[PathBuf]>,
+    codex_dirs: Option<&[PathBuf]>,
     providers: Option<&[String]>,
 ) -> Result<AllLoadResult> {
     let pricing = load_pricing(shared);
     let load_kind = load_kind_for_report(kind);
-    let loaded = load_base_rows(load_kind, shared, &pricing, claude_dirs, providers)?;
+    let loaded = load_base_rows(
+        load_kind,
+        shared,
+        &pricing,
+        claude_dirs,
+        codex_dirs,
+        providers,
+    )?;
     Ok(AllLoadResult {
         rows: finish_rows(kind, loaded.rows, shared),
         detected_agents: loaded.detected_agents,
@@ -55,10 +63,10 @@ pub(super) fn load_sections(
 ) -> Result<AllSectionsLoadResult> {
     let pricing = load_pricing(shared);
     let daily_base = needs_daily_family(kinds)
-        .then(|| load_base_rows(AgentReportKind::Daily, shared, &pricing, None, None))
+        .then(|| load_base_rows(AgentReportKind::Daily, shared, &pricing, None, None, None))
         .transpose()?;
     let session_base = needs_session(kinds)
-        .then(|| load_base_rows(AgentReportKind::Session, shared, &pricing, None, None))
+        .then(|| load_base_rows(AgentReportKind::Session, shared, &pricing, None, None, None))
         .transpose()?;
 
     let daily_detected_agents = daily_base
@@ -115,6 +123,7 @@ fn load_base_rows(
     shared: &SharedArgs,
     pricing: &PricingMap,
     claude_dirs: Option<&[PathBuf]>,
+    codex_dirs: Option<&[PathBuf]>,
     providers: Option<&[String]>,
 ) -> Result<AllLoadResult> {
     let mut progress = crate::progress::UsageLoadProgress::new(
@@ -139,7 +148,7 @@ fn load_base_rows(
             index: 1,
             agent: BUILT_IN_AGENT_NAMES[1],
             progress_agent: crate::progress::UsageLoadAgent::Codex,
-            load: Box::new(|| load_codex_rows(load_kind, &loader_shared, pricing)),
+            load: Box::new(|| load_codex_rows(load_kind, &loader_shared, pricing, codex_dirs)),
         },
         AgentLoadSpec {
             index: 2,
@@ -637,7 +646,20 @@ fn load_codex_rows(
     kind: AgentReportKind,
     shared: &SharedArgs,
     pricing: &PricingMap,
+    codex_dirs: Option<&[PathBuf]>,
 ) -> Result<AgentRows> {
+    if let Some(codex_dirs) = codex_dirs {
+        let groups = codex::load_groups_with_additional_homes(codex_dirs, shared, kind)?;
+        let detected = !groups.is_empty();
+        let speed = codex::resolve_codex_speed(CodexSpeed::Auto);
+        return Ok(AgentRows {
+            rows: groups
+                .iter()
+                .map(|(period, group)| codex_group_row(period, group, pricing, speed))
+                .collect(),
+            detected,
+        });
+    }
     if shared.since.is_none() && shared.until.is_none() {
         let groups = codex::load_groups(shared, kind)?;
         let detected = !groups.is_empty();
