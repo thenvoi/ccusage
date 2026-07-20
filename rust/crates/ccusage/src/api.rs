@@ -16,15 +16,16 @@
 use std::path::PathBuf;
 
 use crate::{
+    BucketKind, DEFAULT_SESSION_DURATION_HOURS, ModelBreakdown, Result, SessionAccumulator,
+    SessionBlock, UsageSummary,
     adapter::{
         all::{loader::load_rows_in, types::AllRow},
         claude::{load_daily_summaries_in, load_entries_in},
     },
     calculate_burn_rate,
-    cli::{normalize_date_bound, AgentReportKind, CostMode, SharedArgs, SortOrder, WeekDay},
+    cli::{AgentReportKind, CostMode, SharedArgs, SortOrder, WeekDay, normalize_date_bound},
     filter_and_sort_summaries, filter_blocks_by_date, identify_session_blocks, sort_blocks,
-    sort_summaries, summarize_by_key, summarize_summaries_by_bucket, BucketKind, ModelBreakdown,
-    Result, SessionAccumulator, SessionBlock, UsageSummary, DEFAULT_SESSION_DURATION_HOURS,
+    sort_summaries, summarize_by_key, summarize_summaries_by_bucket,
 };
 
 /// How costs are derived from usage entries.
@@ -148,6 +149,9 @@ pub struct AgentSessionUsage {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    /// Provider-supplied reasoning/output-thinking tokens when the adapter
+    /// exposes a distinct category. `None` means unavailable, not zero.
+    pub reasoning_tokens: Option<u64>,
     pub total_cost: f64,
     pub models: Vec<AgentModelUsage>,
     /// RFC3339 milliseconds when the adapter exposes it.
@@ -293,6 +297,7 @@ fn agent_session_usage(row: &AllRow) -> AgentSessionUsage {
         output_tokens: row.output_tokens,
         cache_creation_tokens: row.cache_creation_tokens,
         cache_read_tokens: row.cache_read_tokens,
+        reasoning_tokens: metadata_u64(row, "reasoningOutputTokens"),
         total_cost: row.total_cost,
         models: row
             .model_breakdowns
@@ -306,6 +311,10 @@ fn agent_session_usage(row: &AllRow) -> AgentSessionUsage {
 
 fn metadata_string(row: &AllRow, key: &str) -> Option<String> {
     row.metadata.as_ref()?.get(key)?.as_str().map(str::to_owned)
+}
+
+fn metadata_u64(row: &AllRow, key: &str) -> Option<u64> {
+    row.metadata.as_ref()?.get(key)?.as_u64()
 }
 
 fn flatten_agent_rows(rows: Vec<AllRow>) -> Vec<AllRow> {
@@ -700,6 +709,32 @@ mod tests {
             row.last_activity.as_deref(),
             Some("2026-01-10T10:00:00.000Z")
         );
+    }
+
+    #[test]
+    fn agent_session_usage_preserves_provider_reasoning_tokens() {
+        let row = AllRow {
+            period: "codex-session".to_string(),
+            agent: "codex",
+            models_used: vec!["gpt-5.4".to_string()],
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 10,
+            total_tokens: 167,
+            total_cost: 0.25,
+            metadata: Some(serde_json::json!({
+                "lastActivity": "2026-01-10T10:00:00.000Z",
+                "reasoningOutputTokens": 7,
+            })),
+            metadata_agents: Some(vec!["codex"]),
+            agent_breakdowns: None,
+            model_breakdowns: Vec::new(),
+        };
+
+        let usage = agent_session_usage(&row);
+
+        assert_eq!(usage.reasoning_tokens, Some(7));
     }
 
     #[test]
