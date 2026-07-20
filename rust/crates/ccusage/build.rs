@@ -21,8 +21,18 @@ fn main() {
         fetch_pricing_json().expect("fetch LiteLLM pricing for embed")
     };
     let pricing_json = compact_pricing_json(&pricing_json).expect("compact LiteLLM pricing JSON");
+    println!(
+        "cargo:rustc-env=CCUSAGE_EMBEDDED_PRICING_VERSION=fnv1a64:{:016x}",
+        fnv1a64(pricing_json.as_bytes())
+    );
 
     fs::write(out_path, pricing_json).expect("write build-time pricing snapshot");
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 fn out_dir_path(file_name: &str) -> PathBuf {

@@ -17,15 +17,16 @@ use std::path::PathBuf;
 
 use crate::{
     BucketKind, DEFAULT_SESSION_DURATION_HOURS, ModelBreakdown, Result, SessionAccumulator,
-    SessionBlock, UsageSummary,
+    SessionBlock, TokenUsageRaw, UsageSummary,
     adapter::{
         all::{loader::load_rows_in, types::AllRow},
         claude::{load_daily_summaries_in, load_entries_in},
     },
-    calculate_burn_rate,
+    calculate_burn_rate, calculate_cost_for_usage,
     cli::{AgentReportKind, CostMode, SharedArgs, SortOrder, WeekDay, normalize_date_bound},
-    filter_and_sort_summaries, filter_blocks_by_date, identify_session_blocks, sort_blocks,
-    sort_summaries, summarize_by_key, summarize_summaries_by_bucket,
+    filter_and_sort_summaries, filter_blocks_by_date, identify_session_blocks,
+    pricing::PricingMap,
+    sort_blocks, sort_summaries, summarize_by_key, summarize_summaries_by_bucket,
 };
 
 /// How costs are derived from usage entries.
@@ -163,6 +164,70 @@ pub struct AgentSessionUsage {
     /// RFC3339 milliseconds when the adapter exposes it.
     pub first_activity: Option<String>,
     pub last_activity: Option<String>,
+}
+
+/// Provider-neutral token buckets for one deterministic offline price quote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenPriceRequest {
+    pub model: String,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+}
+
+/// One price estimate from the build-pinned embedded catalog.
+///
+/// Missing pricing is explicit and never represented as a zero-dollar quote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenPriceQuote {
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub estimated_cost_usd: Option<f64>,
+    pub missing_pricing: bool,
+    pub currency: &'static str,
+    pub catalog: &'static str,
+    pub catalog_version: &'static str,
+    pub formula_version: &'static str,
+}
+
+/// Price one canonical token vector from the immutable catalog embedded in
+/// this ccusage build. This function performs no file scan or network access.
+#[must_use]
+pub fn quote_embedded_tokens(request: &TokenPriceRequest) -> TokenPriceQuote {
+    let pricing = PricingMap::load_embedded();
+    let resolved_model = crate::model_aliases::resolve_model_name(&request.model).into_owned();
+    let has_tokens = request.input_tokens > 0
+        || request.cached_input_tokens > 0
+        || request.output_tokens > 0
+        || request.cache_creation_input_tokens > 0;
+    let missing_pricing = has_tokens && pricing.find(&request.model).is_none();
+    let usage = TokenUsageRaw {
+        input_tokens: request.input_tokens,
+        output_tokens: request.output_tokens,
+        cache_creation_input_tokens: request.cache_creation_input_tokens,
+        cache_read_input_tokens: request.cached_input_tokens,
+        ..TokenUsageRaw::default()
+    };
+    let estimated_cost_usd = (!missing_pricing).then(|| {
+        calculate_cost_for_usage(
+            Some(&request.model),
+            usage,
+            None,
+            CostMode::Calculate,
+            Some(&pricing),
+        )
+    });
+    TokenPriceQuote {
+        requested_model: request.model.clone(),
+        resolved_model,
+        estimated_cost_usd,
+        missing_pricing,
+        currency: "USD",
+        catalog: "ccusage-embedded",
+        catalog_version: env!("CCUSAGE_EMBEDDED_PRICING_VERSION"),
+        formula_version: "ccusage-token-pricing-v1",
+    }
 }
 
 /// Tokens-per-minute and cost-per-hour over a block's active span.
@@ -743,6 +808,40 @@ mod tests {
         let usage = agent_session_usage(&row);
 
         assert_eq!(usage.reasoning_tokens, Some(7));
+    }
+
+    #[test]
+    fn embedded_price_quote_returns_versioned_usd_estimate_for_known_model() {
+        let quote = quote_embedded_tokens(&TokenPriceRequest {
+            model: "gpt-5.4".to_owned(),
+            input_tokens: 1_000,
+            cached_input_tokens: 500,
+            output_tokens: 250,
+            cache_creation_input_tokens: 0,
+        });
+
+        assert_eq!(quote.requested_model, "gpt-5.4");
+        assert!(!quote.resolved_model.is_empty());
+        assert_eq!(quote.currency, "USD");
+        assert_eq!(quote.catalog, "ccusage-embedded");
+        assert!(quote.catalog_version.starts_with("fnv1a64:"));
+        assert_eq!(quote.formula_version, "ccusage-token-pricing-v1");
+        assert!(!quote.missing_pricing);
+        assert!(quote.estimated_cost_usd.is_some_and(|cost| cost > 0.0));
+    }
+
+    #[test]
+    fn embedded_price_quote_marks_unknown_model_missing_instead_of_zero_cost() {
+        let quote = quote_embedded_tokens(&TokenPriceRequest {
+            model: "provider/definitely-unknown-model".to_owned(),
+            input_tokens: 1_000,
+            cached_input_tokens: 0,
+            output_tokens: 250,
+            cache_creation_input_tokens: 0,
+        });
+
+        assert!(quote.missing_pricing);
+        assert_eq!(quote.estimated_cost_usd, None);
     }
 
     #[test]
