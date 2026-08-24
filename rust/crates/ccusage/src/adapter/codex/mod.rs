@@ -10,6 +10,7 @@ use crate::{PricingMap, Result, cli::AgentCommandArgs, log_level, print_json_or_
 
 pub(crate) use aggregate::{aggregate_events, filter_events_by_date, load_groups};
 pub(crate) use loader::load_codex_events;
+pub(crate) use loader::load_codex_events_from_captured_manifest;
 #[cfg(test)]
 pub(crate) use loader::load_codex_events_from_directory;
 pub(crate) use report::{
@@ -133,6 +134,8 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 105,
                 is_fallback_model: false,
+                counter_mode: crate::CodexCounterMode::Delta,
+                counter_epoch: 0,
             }],
             AgentReportKind::Daily,
             Some("UTC"),
@@ -176,6 +179,8 @@ mod tests {
                     reasoning_output_tokens: 0,
                     total_tokens: 105,
                     is_fallback_model: false,
+                    counter_mode: crate::CodexCounterMode::Delta,
+                    counter_epoch: 0,
                 },
                 CodexTokenUsageEvent {
                     session_id: "session-1".to_string(),
@@ -187,6 +192,8 @@ mod tests {
                     reasoning_output_tokens: 0,
                     total_tokens: 53,
                     is_fallback_model: false,
+                    counter_mode: crate::CodexCounterMode::Delta,
+                    counter_epoch: 0,
                 },
             ],
             AgentReportKind::Daily,
@@ -418,6 +425,8 @@ mod tests {
                 reasoning_output_tokens: 2,
                 total_tokens: 147,
                 is_fallback_model: false,
+                counter_mode: crate::CodexCounterMode::Delta,
+                counter_epoch: 0,
             },
             CodexTokenUsageEvent {
                 session_id: "/workspace/api/session-a.jsonl".to_string(),
@@ -429,6 +438,8 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 80,
                 is_fallback_model: true,
+                counter_mode: crate::CodexCounterMode::Delta,
+                counter_epoch: 0,
             },
             CodexTokenUsageEvent {
                 session_id: "/workspace/web/session-b.jsonl".to_string(),
@@ -440,6 +451,8 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 12,
                 is_fallback_model: false,
+                counter_mode: crate::CodexCounterMode::Delta,
+                counter_epoch: 0,
             },
             CodexTokenUsageEvent {
                 session_id: "ignored-missing-model".to_string(),
@@ -451,6 +464,8 @@ mod tests {
                 reasoning_output_tokens: 0,
                 total_tokens: 1_998,
                 is_fallback_model: false,
+                counter_mode: crate::CodexCounterMode::Delta,
+                counter_epoch: 0,
             },
         ];
 

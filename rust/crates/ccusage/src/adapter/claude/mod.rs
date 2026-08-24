@@ -50,6 +50,47 @@ pub(crate) fn load_entries_in(
     })
 }
 
+/// Parse only the caller-provided manifest. This is used by bounded embedding
+/// scans so files added after enumeration cannot join the snapshot.
+pub(crate) fn load_entries_from_captured_files<'a>(
+    shared: &SharedArgs,
+    files: impl IntoIterator<Item = (&'a Path, &'a [u8])>,
+    max_events: usize,
+) -> Result<Vec<LoadedEntry>> {
+    let pricing = if shared.mode == CostMode::Display {
+        None
+    } else {
+        Some(PricingMap::load_with_overrides(
+            shared.offline,
+            log_level() != Some(0),
+            shared.pricing_overrides.iter(),
+        ))
+    };
+    let tz = parse_tz(shared.timezone.as_deref());
+    let mut deduped_indexes: FxHashMap<u64, SmallIndexVec> = FxHashMap::default();
+    let mut deduped = Vec::new();
+    for (file, content) in files {
+        for entry in parse_usage_file_content(
+            file,
+            content,
+            tz.as_ref(),
+            shared.mode,
+            pricing.as_ref(),
+            Some(max_events.saturating_sub(deduped.len())),
+        )?
+        .entries
+        {
+            push_deduped_entry(entry, &mut deduped_indexes, &mut deduped);
+            if deduped.len() > max_events {
+                return Err(crate::cli_error(format!(
+                    "detailed event limit exceeded: more than {max_events}"
+                )));
+            }
+        }
+    }
+    Ok(deduped)
+}
+
 pub(crate) fn load_daily_summaries(
     shared: &SharedArgs,
     project_filter: Option<&str>,
@@ -360,6 +401,23 @@ fn read_usage_file(
     mode: CostMode,
     pricing: Option<&PricingMap>,
 ) -> LoadedFile {
+    let content = fs::read(path).unwrap_or_default();
+    parse_usage_file_content(path, &content, tz, mode, pricing, None).unwrap_or_else(|_| {
+        LoadedFile {
+            timestamp: None,
+            entries: Vec::new(),
+        }
+    })
+}
+
+fn parse_usage_file_content(
+    path: &Path,
+    content: &[u8],
+    tz: Option<&JiffTimeZone>,
+    mode: CostMode,
+    pricing: Option<&PricingMap>,
+    max_entries: Option<usize>,
+) -> Result<LoadedFile> {
     let project: Arc<str> = Arc::from(extract_project(path));
     let (session_id, project_path) = extract_session_parts(path);
     let session_id: Arc<str> = Arc::from(session_id);
@@ -368,12 +426,8 @@ fn read_usage_file(
         timestamp: None,
         entries: Vec::new(),
     };
-    let Ok(content) = fs::read(path) else {
-        return loaded_file;
-    };
-
     let usage_marker = memmem::Finder::new(br#""usage":{"#);
-    for line in byte_lines(&content) {
+    for line in byte_lines(content) {
         if usage_marker.find(line).is_none() {
             continue;
         }
@@ -425,8 +479,27 @@ fn read_usage_file(
             usage_limit_reset_time,
             missing_pricing_model,
         };
+        if max_entries.is_some_and(|limit| loaded_file.entries.len() >= limit) {
+            return Err(crate::cli_error(format!(
+                "detailed event limit exceeded: more than {}",
+                max_entries.unwrap_or_default()
+            )));
+        }
         let mut advisor_entries = Vec::new();
         for (index, advisor) in advisor_usages_from_line(line).into_iter().enumerate() {
+            if max_entries.is_some_and(|limit| {
+                loaded_file
+                    .entries
+                    .len()
+                    .saturating_add(1)
+                    .saturating_add(advisor_entries.len())
+                    >= limit
+            }) {
+                return Err(crate::cli_error(format!(
+                    "detailed event limit exceeded: more than {}",
+                    max_entries.unwrap_or_default()
+                )));
+            }
             let mut advisor_data = entry.data.clone();
             advisor_data.message.id = advisor_data
                 .message
@@ -464,10 +537,19 @@ fn read_usage_file(
                 missing_pricing_model,
             });
         }
+        let additional_entries = 1_usize.saturating_add(advisor_entries.len());
+        if max_entries.is_some_and(|limit| {
+            loaded_file.entries.len().saturating_add(additional_entries) > limit
+        }) {
+            return Err(crate::cli_error(format!(
+                "detailed event limit exceeded: more than {}",
+                max_entries.unwrap_or_default()
+            )));
+        }
         loaded_file.entries.push(entry);
         loaded_file.entries.extend(advisor_entries);
     }
-    loaded_file
+    Ok(loaded_file)
 }
 
 #[derive(Debug, Deserialize)]

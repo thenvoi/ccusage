@@ -148,6 +148,15 @@ pub(crate) struct CodexTokenUsageEvent {
     pub(crate) reasoning_output_tokens: u64,
     pub(crate) total_tokens: u64,
     pub(crate) is_fallback_model: bool,
+    pub(crate) counter_mode: CodexCounterMode,
+    pub(crate) counter_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexCounterMode {
+    Delta,
+    CumulativeDelta,
+    CumulativeDecreaseAmbiguous,
 }
 
 #[derive(Debug, Clone, Default)]

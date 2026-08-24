@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    parser::visit_codex_session_file,
+    parser::{visit_codex_session_bytes, visit_codex_session_file},
     paths::{
         CodexUsageSource, codex_usage_sources, collect_codex_usage_files,
         collect_deduped_codex_usage_files,
@@ -32,6 +32,27 @@ pub(crate) fn load_codex_events_from_directory(
         read_codex_session_files_parallel(sessions_dir, &files)
     };
     dedupe_codex_events(&mut events);
+    Ok(events)
+}
+
+/// Parse only caller-captured `(sessions_root, file)` pairs. No tuple-based
+/// deduplication is applied because Codex does not expose provider event IDs.
+pub(crate) fn load_codex_events_from_captured_manifest<'a>(
+    files: impl IntoIterator<Item = (&'a Path, &'a Path, &'a [u8])>,
+    max_events: usize,
+) -> Result<Vec<CodexTokenUsageEvent>> {
+    let mut events = Vec::new();
+    for (sessions_dir, file, content) in files {
+        visit_codex_session_bytes(sessions_dir, file, content, |event| {
+            if events.len() >= max_events {
+                return Err(crate::cli_error(format!(
+                    "detailed event limit exceeded: more than {max_events}"
+                )));
+            }
+            events.push(event);
+            Ok(())
+        })?;
+    }
     Ok(events)
 }
 
@@ -157,6 +178,8 @@ mod tests {
             reasoning_output_tokens: 0,
             total_tokens: 150,
             is_fallback_model: false,
+            counter_mode: crate::CodexCounterMode::Delta,
+            counter_epoch: 0,
         }
     }
 

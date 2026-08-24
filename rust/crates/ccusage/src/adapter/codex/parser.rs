@@ -10,7 +10,7 @@ use memchr::memmem::Finder;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{CodexRawUsage, CodexTokenUsageEvent, Result, TimestampMs};
+use crate::{CodexCounterMode, CodexRawUsage, CodexTokenUsageEvent, Result, TimestampMs};
 
 use super::types::{
     CodexInfo, CodexLogEntry, CodexModelMetadata, CodexPayload, CodexResultFields,
@@ -79,7 +79,10 @@ fn detect_replay_second(path: &Path) -> Option<[u8; 19]> {
     let Ok(file) = fs::File::open(path) else {
         return None;
     };
-    let mut reader = BufReader::new(file);
+    detect_replay_second_in(BufReader::new(file))
+}
+
+fn detect_replay_second_in(mut reader: impl BufRead) -> Option<[u8; 19]> {
     let mut line = Vec::new();
     let mut first_second: Option<[u8; 19]> = None;
 
@@ -138,7 +141,7 @@ fn detect_replay_second(path: &Path) -> Option<[u8; 19]> {
 pub(super) fn visit_codex_session_file(
     sessions_dir: &Path,
     path: &Path,
-    mut visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
+    visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
 ) -> Result<()> {
     let is_replay_session = is_codex_replay_session(path);
     let replay_second = is_replay_session
@@ -147,13 +150,56 @@ pub(super) fn visit_codex_session_file(
     let Ok(file) = fs::File::open(path) else {
         return Ok(());
     };
-    let mut reader = BufReader::with_capacity(128 * 1024, file);
+    let fallback_timestamp = file_modified_timestamp(path);
+    visit_codex_session_reader(
+        sessions_dir,
+        path,
+        BufReader::with_capacity(128 * 1024, file),
+        replay_second,
+        fallback_timestamp,
+        visit,
+    )
+}
+
+pub(super) fn visit_codex_session_bytes(
+    sessions_dir: &Path,
+    path: &Path,
+    content: &[u8],
+    visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
+) -> Result<()> {
+    let replay_prefix = &content[..content.len().min(16 * 1024)];
+    let is_replay_session = THREAD_SPAWN_FINDER.find(replay_prefix).is_some()
+        || FORKED_FROM_ID_FINDER.find(replay_prefix).is_some();
+    let replay_second = is_replay_session
+        .then(|| detect_replay_second_in(std::io::Cursor::new(content)))
+        .flatten();
+    visit_codex_session_reader(
+        sessions_dir,
+        path,
+        std::io::Cursor::new(content),
+        replay_second,
+        // Captured scans must not consult mutable file metadata after the
+        // bytes are captured. Timestamp-less headless records remain blocked
+        // from durable capture by the feasibility result.
+        crate::format_rfc3339_millis(TimestampMs::UNIX_EPOCH),
+        visit,
+    )
+}
+
+fn visit_codex_session_reader(
+    sessions_dir: &Path,
+    path: &Path,
+    mut reader: impl BufRead,
+    replay_second: Option<[u8; 19]>,
+    fallback_timestamp: String,
+    mut visit: impl FnMut(CodexTokenUsageEvent) -> Result<()>,
+) -> Result<()> {
     let mut line = Vec::new();
     let session_id = codex_session_id(sessions_dir, path);
     let mut previous_totals: Option<CodexRawUsage> = None;
+    let mut counter_epoch = 0;
     let mut current_model: Option<String> = None;
     let mut current_model_is_fallback = false;
-    let fallback_timestamp = file_modified_timestamp(path);
     let mut skip_replay = replay_second.is_some();
 
     loop {
@@ -205,6 +251,7 @@ pub(super) fn visit_codex_session_file(
                     &session_id,
                     value,
                     &mut previous_totals,
+                    &mut counter_epoch,
                     &mut current_model,
                     &mut current_model_is_fallback,
                     &mut visit,
@@ -241,6 +288,7 @@ fn visit_codex_session_entry(
     session_id: &str,
     value: CodexSessionLogEntry<'_>,
     previous_totals: &mut Option<CodexRawUsage>,
+    counter_epoch: &mut u64,
     current_model: &mut Option<String>,
     current_model_is_fallback: &mut bool,
     visit: &mut impl FnMut(CodexTokenUsageEvent) -> Result<()>,
@@ -267,13 +315,18 @@ fn visit_codex_session_entry(
     }
     let info = payload.info.as_ref();
     let total_usage = info.and_then(|info| info.total_token_usage.as_ref().copied());
-    let raw_usage = info
-        .and_then(|info| info.last_token_usage.as_ref().copied())
-        .or_else(|| {
-            total_usage
+    let last_usage = info.and_then(|info| info.last_token_usage.as_ref().copied());
+    let cumulative_decrease = last_usage.is_none()
+        && total_usage.is_some_and(|usage| {
+            previous_totals
                 .as_ref()
-                .map(|usage| subtract_codex_raw_usage(usage, previous_totals.as_ref()))
+                .is_some_and(|previous| codex_counter_reset(&usage, previous))
         });
+    let raw_usage = last_usage.or_else(|| {
+        total_usage
+            .as_ref()
+            .map(|usage| subtract_codex_raw_usage(usage, previous_totals.as_ref()))
+    });
     if let Some(total_usage) = total_usage {
         *previous_totals = Some(total_usage);
     }
@@ -307,6 +360,14 @@ fn visit_codex_session_entry(
         reasoning_output_tokens: raw_usage.reasoning_output_tokens,
         total_tokens: raw_usage.total_tokens,
         is_fallback_model,
+        counter_mode: if last_usage.is_some() {
+            CodexCounterMode::Delta
+        } else if cumulative_decrease {
+            CodexCounterMode::CumulativeDecreaseAmbiguous
+        } else {
+            CodexCounterMode::CumulativeDelta
+        },
+        counter_epoch: *counter_epoch,
     })
 }
 
@@ -395,6 +456,8 @@ fn visit_codex_exec_usage_event(
         reasoning_output_tokens: raw_usage.reasoning_output_tokens,
         total_tokens: raw_usage.total_tokens,
         is_fallback_model,
+        counter_mode: CodexCounterMode::Delta,
+        counter_epoch: 0,
     })
 }
 
@@ -977,6 +1040,14 @@ fn subtract_codex_raw_usage(
             .total_tokens
             .saturating_sub(previous.map_or(0, |usage| usage.total_tokens)),
     }
+}
+
+fn codex_counter_reset(current: &CodexRawUsage, previous: &CodexRawUsage) -> bool {
+    current.input_tokens < previous.input_tokens
+        || current.cached_input_tokens < previous.cached_input_tokens
+        || current.output_tokens < previous.output_tokens
+        || current.reasoning_output_tokens < previous.reasoning_output_tokens
+        || current.total_tokens < previous.total_tokens
 }
 
 #[cfg(test)]

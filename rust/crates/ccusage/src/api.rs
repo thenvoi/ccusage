@@ -13,19 +13,140 @@
 //! (mirroring the CLI). All-provider functions scan every supported adapter;
 //! `UsageOptions::claude_dirs` only overrides Claude Code discovery.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, fs, io::Read, path::PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::{
+    BucketKind, DEFAULT_SESSION_DURATION_HOURS, ModelBreakdown, Result, SessionAccumulator,
+    SessionBlock, UsageSummary,
     adapter::{
         all::{loader::load_rows_in, types::AllRow},
-        claude::{load_daily_summaries_in, load_entries_in},
+        claude::{load_daily_summaries_in, load_entries_from_captured_files, load_entries_in},
+        codex::load_codex_events_from_captured_manifest,
     },
     calculate_burn_rate,
-    cli::{normalize_date_bound, AgentReportKind, CostMode, SharedArgs, SortOrder, WeekDay},
+    cli::{AgentReportKind, CostMode, SharedArgs, SortOrder, WeekDay, normalize_date_bound},
     filter_and_sort_summaries, filter_blocks_by_date, identify_session_blocks, sort_blocks,
-    sort_summaries, summarize_by_key, summarize_summaries_by_bucket, BucketKind, ModelBreakdown,
-    Result, SessionAccumulator, SessionBlock, UsageSummary, DEFAULT_SESSION_DURATION_HOURS,
+    sort_summaries, summarize_by_key, summarize_summaries_by_bucket,
 };
+
+/// Provider supported by the body-free detailed event prototype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DetailedUsageProvider {
+    Claude,
+    Codex,
+}
+
+/// Provider-native identity parts. An absent identity is reported as `None`;
+/// embedders must never synthesize one from timestamp or token values.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProviderEventId {
+    pub primary: String,
+    pub secondary: Option<String>,
+}
+
+/// Whether token values were emitted as a delta or derived from a cumulative
+/// counter. A decrease remains explicitly ambiguous when provider data cannot
+/// distinguish reset from correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DetailedCounterMode {
+    Delta,
+    CumulativeDelta,
+    CumulativeDecreaseAmbiguous,
+}
+
+/// Permission state for parsing detailed provider logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailedCapturePermission {
+    Denied,
+    Granted,
+}
+
+/// Explicit, bounded inputs for detailed capture. Calling this API represents
+/// detailed-capture consent; it never performs default home-directory discovery.
+#[derive(Debug, Clone)]
+pub struct DetailedUsageOptions {
+    /// Must be `Granted`. Denied calls return before directory enumeration.
+    pub capture_permission: DetailedCapturePermission,
+    /// Explicit Claude config roots, each containing `projects/`.
+    pub claude_dirs: Vec<PathBuf>,
+    /// Explicit Codex `sessions/` or `archived_sessions/` directories.
+    pub codex_session_dirs: Vec<PathBuf>,
+    /// Maximum combined size of JSONL sources. Checked before any log parsing.
+    pub max_source_bytes: u64,
+    /// Maximum number of JSONL files captured in one manifest.
+    pub max_source_files: usize,
+    /// Maximum recursive directory depth below each explicit provider root.
+    pub max_directory_depth: usize,
+    /// Maximum explicit roots plus directory entries inspected, including
+    /// directories and files that are not JSONL sources.
+    pub max_discovery_entries: usize,
+    /// Maximum normalized events returned from one scan.
+    pub max_events: usize,
+}
+
+/// One body-free normalized token event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailedUsageEvent {
+    pub provider: DetailedUsageProvider,
+    pub session_id: String,
+    pub provider_event_id: Option<ProviderEventId>,
+    pub timestamp: String,
+    pub model: Option<String>,
+    /// Non-cached input tokens. Cached input is reported separately.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    /// Included in `output_tokens` for Codex; never add it again to totals.
+    pub reasoning_output_tokens: u64,
+    pub total_cost: Option<f64>,
+    pub missing_pricing: bool,
+    pub counter_mode: DetailedCounterMode,
+    /// Proven source epoch. Remains zero when reset provenance is unavailable.
+    pub counter_epoch: u64,
+}
+
+/// Failed proof obligations that prohibit durable detailed-event capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailedCaptureBlocker {
+    AuthoritativeCorrectionOrderUnavailable,
+    ProviderEventIdentityUnavailable,
+    CumulativeResetVsCorrectionAmbiguous,
+    ExactCostReconciliationUnavailable,
+    BaselineCarryInReconciliationUnavailable,
+}
+
+/// Provider-specific graduation result. Events from a blocked prototype may
+/// be inspected in memory for reconciliation tests but must not be persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailedProviderFeasibility {
+    pub durable_capture_allowed: bool,
+    pub blockers: Vec<DetailedCaptureBlocker>,
+}
+
+/// Provider-scoped evidence needed by a caller's feasibility gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailedSourceSnapshot {
+    pub provider: DetailedUsageProvider,
+    /// SHA-256 revision of canonical body-free usage and correction fields.
+    pub source_revision: String,
+    pub source_bytes: u64,
+    pub event_count: usize,
+    pub observed_lower_bound: Option<String>,
+    pub observed_upper_bound: Option<String>,
+    pub identity_complete: bool,
+    pub feasibility: DetailedProviderFeasibility,
+}
+
+/// Result of one consented, bounded scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailedUsageScan {
+    pub events: Vec<DetailedUsageEvent>,
+    pub sources: Vec<DetailedSourceSnapshot>,
+    pub source_bytes: u64,
+}
 
 /// How costs are derived from usage entries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -520,6 +641,412 @@ pub fn all_sessions(opts: &UsageOptions) -> Result<Vec<AgentSessionUsage>> {
         .collect())
 }
 
+#[derive(Debug)]
+struct ManifestFile {
+    root: PathBuf,
+    path: PathBuf,
+    content: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct SourceManifest {
+    files: Vec<ManifestFile>,
+    source_bytes: u64,
+    discovery_entries: usize,
+}
+
+fn charge_discovery_entry(observed: &mut usize, limit: usize) -> Result<()> {
+    *observed = observed
+        .checked_add(1)
+        .ok_or_else(|| crate::cli_error("detailed discovery entry count overflow"))?;
+    if *observed > limit {
+        return Err(crate::cli_error(format!(
+            "detailed discovery entry limit exceeded: more than {limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn source_manifest(
+    roots: impl IntoIterator<Item = (PathBuf, PathBuf)>,
+    max_source_bytes: u64,
+    max_source_files: usize,
+    max_directory_depth: usize,
+    max_discovery_entries: usize,
+) -> Result<SourceManifest> {
+    let mut discovered = BTreeMap::<PathBuf, PathBuf>::new();
+    let mut discovery_entries = 0_usize;
+    for (provider_root, scan_root) in roots {
+        charge_discovery_entry(&mut discovery_entries, max_discovery_entries)?;
+        let mut pending = vec![(scan_root, 0_usize)];
+        while let Some((dir, depth)) = pending.pop() {
+            let entries = fs::read_dir(&dir).map_err(|error| {
+                crate::cli_error(format!(
+                    "cannot enumerate detailed source {}: {error}",
+                    dir.display()
+                ))
+            })?;
+            for entry in entries {
+                charge_discovery_entry(&mut discovery_entries, max_discovery_entries)?;
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                let path = entry.path();
+                if file_type.is_dir() {
+                    if depth >= max_directory_depth {
+                        return Err(crate::cli_error(format!(
+                            "detailed source directory depth limit exceeded at {}",
+                            path.display()
+                        )));
+                    }
+                    pending.push((path, depth + 1));
+                } else if file_type.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                {
+                    discovered
+                        .entry(path)
+                        .or_insert_with(|| provider_root.clone());
+                    if discovered.len() > max_source_files {
+                        return Err(crate::cli_error(format!(
+                            "detailed source file limit exceeded: more than {max_source_files}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut files = Vec::with_capacity(discovered.len());
+    let mut source_bytes = 0_u64;
+    for (path, root) in discovered {
+        let len = fs::metadata(&path)?.len();
+        source_bytes = source_bytes
+            .checked_add(len)
+            .ok_or_else(|| crate::cli_error("detailed source byte count overflow"))?;
+        if source_bytes > max_source_bytes {
+            return Err(crate::cli_error(format!(
+                "detailed source byte limit exceeded: {source_bytes} > {max_source_bytes}"
+            )));
+        }
+        let capacity = usize::try_from(len)
+            .map_err(|_| crate::cli_error("detailed source is too large for this platform"))?;
+        let mut content = Vec::with_capacity(capacity);
+        let mut input = fs::File::open(&path)?.take(len.saturating_add(1));
+        input.read_to_end(&mut content)?;
+        if content.len() as u64 != len {
+            return Err(crate::cli_error(format!(
+                "detailed source changed while capturing manifest: {}",
+                path.display()
+            )));
+        }
+        files.push(ManifestFile {
+            root,
+            path,
+            content,
+        });
+    }
+    Ok(SourceManifest {
+        files,
+        source_bytes,
+        discovery_entries,
+    })
+}
+
+fn revision_field(hasher: &mut Sha256, value: impl AsRef<[u8]>) {
+    let value = value.as_ref();
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn finish_revision(hasher: Sha256) -> String {
+    let digest = hasher.finalize();
+    let mut revision = String::with_capacity("sha256:".len() + digest.len() * 2);
+    revision.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(revision, "{byte:02x}");
+    }
+    revision
+}
+
+fn hash_detailed_event(hasher: &mut Sha256, event: &DetailedUsageEvent) {
+    revision_field(hasher, format!("{:?}", event.provider));
+    revision_field(hasher, &event.session_id);
+    if let Some(id) = &event.provider_event_id {
+        revision_field(hasher, &id.primary);
+        revision_field(hasher, id.secondary.as_deref().unwrap_or(""));
+    } else {
+        revision_field(hasher, "<missing-id>");
+    }
+    revision_field(hasher, &event.timestamp);
+    revision_field(hasher, event.model.as_deref().unwrap_or(""));
+    for value in [
+        event.input_tokens,
+        event.output_tokens,
+        event.cache_creation_tokens,
+        event.cache_read_tokens,
+        event.reasoning_output_tokens,
+        event.total_cost.map(f64::to_bits).unwrap_or_default(),
+        event.counter_epoch,
+    ] {
+        hasher.update(value.to_le_bytes());
+    }
+    hasher.update([event.missing_pricing as u8]);
+    revision_field(hasher, format!("{:?}", event.counter_mode));
+}
+
+fn detailed_revision(events: &[DetailedUsageEvent]) -> String {
+    let mut hasher = Sha256::new();
+    for event in events {
+        hash_detailed_event(&mut hasher, event);
+    }
+    finish_revision(hasher)
+}
+
+fn claude_revision(manifest: &SourceManifest, events: &[DetailedUsageEvent]) -> String {
+    let mut hasher = Sha256::new();
+    for file in &manifest.files {
+        let relative_path = file.path.strip_prefix(&file.root).unwrap_or(&file.path);
+        revision_field(&mut hasher, relative_path.to_string_lossy().as_bytes());
+        for line in crate::fast::byte_lines(&file.content) {
+            let Ok(entry) = serde_json::from_slice::<crate::UsageEntry>(line) else {
+                continue;
+            };
+            revision_field(&mut hasher, &entry.timestamp);
+            revision_field(&mut hasher, entry.session_id.as_deref().unwrap_or(""));
+            revision_field(&mut hasher, entry.message.id.as_deref().unwrap_or(""));
+            revision_field(&mut hasher, entry.request_id.as_deref().unwrap_or(""));
+            revision_field(&mut hasher, entry.message.model.as_deref().unwrap_or(""));
+            let usage = entry.message.usage;
+            for value in [
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_token_count(),
+                usage.cache_read_input_tokens,
+                entry.cost_usd.map(f64::to_bits).unwrap_or_default(),
+            ] {
+                hasher.update(value.to_le_bytes());
+            }
+        }
+    }
+    for event in events {
+        hash_detailed_event(&mut hasher, event);
+    }
+    finish_revision(hasher)
+}
+
+fn detailed_snapshot(
+    provider: DetailedUsageProvider,
+    events: &[DetailedUsageEvent],
+    manifest: &SourceManifest,
+    source_revision: String,
+) -> DetailedSourceSnapshot {
+    let blockers = match provider {
+        DetailedUsageProvider::Claude => vec![
+            DetailedCaptureBlocker::AuthoritativeCorrectionOrderUnavailable,
+            DetailedCaptureBlocker::BaselineCarryInReconciliationUnavailable,
+        ],
+        DetailedUsageProvider::Codex => vec![
+            DetailedCaptureBlocker::ProviderEventIdentityUnavailable,
+            DetailedCaptureBlocker::CumulativeResetVsCorrectionAmbiguous,
+            DetailedCaptureBlocker::ExactCostReconciliationUnavailable,
+            DetailedCaptureBlocker::BaselineCarryInReconciliationUnavailable,
+        ],
+    };
+    DetailedSourceSnapshot {
+        provider,
+        source_revision,
+        source_bytes: manifest.source_bytes,
+        event_count: events.len(),
+        observed_lower_bound: events.iter().map(|event| &event.timestamp).min().cloned(),
+        observed_upper_bound: events.iter().map(|event| &event.timestamp).max().cloned(),
+        identity_complete: events.iter().all(|event| event.provider_event_id.is_some()),
+        feasibility: DetailedProviderFeasibility {
+            durable_capture_allowed: blockers.is_empty(),
+            blockers,
+        },
+    }
+}
+
+fn sort_detailed_events(events: &mut [DetailedUsageEvent]) {
+    events.sort_by(|left, right| {
+        (
+            left.provider,
+            &left.timestamp,
+            &left.session_id,
+            &left.provider_event_id,
+            &left.model,
+        )
+            .cmp(&(
+                right.provider,
+                &right.timestamp,
+                &right.session_id,
+                &right.provider_event_id,
+                &right.model,
+            ))
+    });
+}
+
+/// Read normalized, body-free Claude and Codex token events from explicit
+/// consented directories. The call is bounded by source bytes and event count,
+/// and performs no implicit provider discovery.
+pub fn detailed_usage_events(opts: &DetailedUsageOptions) -> Result<DetailedUsageScan> {
+    if opts.capture_permission != DetailedCapturePermission::Granted {
+        return Err(crate::cli_error(
+            "detailed capture permission has not been granted",
+        ));
+    }
+    let claude_manifest = source_manifest(
+        opts.claude_dirs
+            .iter()
+            .cloned()
+            .map(|root| (root.clone(), root.join("projects"))),
+        opts.max_source_bytes,
+        opts.max_source_files,
+        opts.max_directory_depth,
+        opts.max_discovery_entries,
+    )?;
+    let codex_manifest = source_manifest(
+        opts.codex_session_dirs
+            .iter()
+            .cloned()
+            .map(|root| (root.clone(), root)),
+        opts.max_source_bytes
+            .saturating_sub(claude_manifest.source_bytes),
+        opts.max_source_files
+            .saturating_sub(claude_manifest.files.len()),
+        opts.max_directory_depth,
+        opts.max_discovery_entries
+            .saturating_sub(claude_manifest.discovery_entries),
+    )?;
+    let total_bytes = claude_manifest
+        .source_bytes
+        .checked_add(codex_manifest.source_bytes)
+        .ok_or_else(|| crate::cli_error("detailed source byte count overflow"))?;
+    if total_bytes > opts.max_source_bytes {
+        return Err(crate::cli_error(format!(
+            "detailed source byte limit exceeded: {total_bytes} > {}",
+            opts.max_source_bytes
+        )));
+    }
+
+    let shared = SharedArgs {
+        json: true,
+        offline: true,
+        ..SharedArgs::default()
+    };
+    let mut claude_events = if opts.claude_dirs.is_empty() {
+        Vec::new()
+    } else {
+        load_entries_from_captured_files(
+            &shared,
+            claude_manifest
+                .files
+                .iter()
+                .map(|file| (file.path.as_path(), file.content.as_slice())),
+            opts.max_events,
+        )?
+        .into_iter()
+        .map(|entry| {
+            let usage = entry.data.message.usage;
+            DetailedUsageEvent {
+                provider: DetailedUsageProvider::Claude,
+                session_id: entry.session_id.to_string(),
+                provider_event_id: entry.data.message.id.map(|primary| ProviderEventId {
+                    primary,
+                    secondary: entry.data.request_id,
+                }),
+                timestamp: entry.data.timestamp,
+                model: entry.model,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_creation_tokens: usage.cache_creation_token_count(),
+                cache_read_tokens: usage.cache_read_input_tokens,
+                reasoning_output_tokens: 0,
+                total_cost: Some(entry.cost),
+                missing_pricing: entry.missing_pricing_model.is_some(),
+                counter_mode: DetailedCounterMode::Delta,
+                counter_epoch: 0,
+            }
+        })
+        .collect::<Vec<_>>()
+    };
+
+    let mut codex_events = load_codex_events_from_captured_manifest(
+        codex_manifest.files.iter().map(|file| {
+            (
+                file.root.as_path(),
+                file.path.as_path(),
+                file.content.as_slice(),
+            )
+        }),
+        opts.max_events.saturating_sub(claude_events.len()),
+    )?
+    .into_iter()
+    .map(|event| DetailedUsageEvent {
+        provider: DetailedUsageProvider::Codex,
+        session_id: event.session_id,
+        // Codex token_count records do not carry a provider event
+        // ID. Deliberately report the gap instead of synthesizing
+        // identity from mutable token or timestamp fields.
+        provider_event_id: None,
+        timestamp: event.timestamp,
+        model: event.model,
+        input_tokens: event.input_tokens.saturating_sub(event.cached_input_tokens),
+        output_tokens: event.output_tokens,
+        cache_creation_tokens: 0,
+        cache_read_tokens: event.cached_input_tokens,
+        reasoning_output_tokens: event.reasoning_output_tokens,
+        total_cost: None,
+        missing_pricing: true,
+        counter_mode: match event.counter_mode {
+            crate::CodexCounterMode::Delta => DetailedCounterMode::Delta,
+            crate::CodexCounterMode::CumulativeDelta => DetailedCounterMode::CumulativeDelta,
+            crate::CodexCounterMode::CumulativeDecreaseAmbiguous => {
+                DetailedCounterMode::CumulativeDecreaseAmbiguous
+            }
+        },
+        counter_epoch: event.counter_epoch,
+    })
+    .collect::<Vec<_>>();
+    sort_detailed_events(&mut claude_events);
+    sort_detailed_events(&mut codex_events);
+
+    let event_count = claude_events
+        .len()
+        .checked_add(codex_events.len())
+        .ok_or_else(|| crate::cli_error("detailed event count overflow"))?;
+    if event_count > opts.max_events {
+        return Err(crate::cli_error(format!(
+            "detailed event limit exceeded: {event_count} > {}",
+            opts.max_events
+        )));
+    }
+
+    let sources = vec![
+        detailed_snapshot(
+            DetailedUsageProvider::Claude,
+            &claude_events,
+            &claude_manifest,
+            claude_revision(&claude_manifest, &claude_events),
+        ),
+        detailed_snapshot(
+            DetailedUsageProvider::Codex,
+            &codex_events,
+            &codex_manifest,
+            detailed_revision(&codex_events),
+        ),
+    ];
+    claude_events.extend(codex_events);
+    sort_detailed_events(&mut claude_events);
+    Ok(DetailedUsageScan {
+        events: claude_events,
+        sources,
+        source_bytes: total_bytes,
+    })
+}
+
 /// Billing blocks (`session_hours`-long windows, gap blocks included),
 /// sorted by start time. With `active_only`, only the currently-active
 /// block (if any) is returned.
@@ -594,6 +1121,478 @@ mod tests {
             timezone: Some("UTC".to_string()),
             ..UsageOptions::default()
         }
+    }
+
+    fn codex_cumulative(ts: &str, input: u64, cached: u64, output: u64) -> String {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input,
+                        "cached_input_tokens": cached,
+                        "output_tokens": output,
+                        "total_tokens": input + output,
+                    },
+                    "model": "gpt-5",
+                },
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn detailed_claude_events_are_body_free_and_keep_provider_identity() {
+        let fixture = fs_fixture!({
+            "projects/proj-a/session.jsonl": format!(
+                r#"{{"timestamp":"2026-01-10T10:00:00.000Z","message":{{"id":"m1","model":"claude-opus-4-6","content":"DO_NOT_RETAIN_SENTINEL","usage":{{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}},"requestId":"r1","costUSD":0.5}}"#
+            ),
+        });
+        let opts = DetailedUsageOptions {
+            capture_permission: DetailedCapturePermission::Granted,
+            claude_dirs: vec![fixture.root().to_path_buf()],
+            codex_session_dirs: Vec::new(),
+            max_source_bytes: 1024 * 1024,
+            max_source_files: 10,
+            max_directory_depth: 8,
+            max_discovery_entries: 100,
+            max_events: 10,
+        };
+
+        let scan = detailed_usage_events(&opts).unwrap();
+
+        assert_eq!(scan.events.len(), 1);
+        let event = &scan.events[0];
+        assert_eq!(event.provider, DetailedUsageProvider::Claude);
+        assert_eq!(event.session_id, "session");
+        assert_eq!(
+            event.provider_event_id,
+            Some(ProviderEventId {
+                primary: "m1".to_string(),
+                secondary: Some("r1".to_string()),
+            })
+        );
+        assert_eq!(event.counter_mode, DetailedCounterMode::Delta);
+        assert_eq!(event.counter_epoch, 0);
+        assert_eq!(event.input_tokens, 100);
+        assert_eq!(event.output_tokens, 10);
+        assert_eq!(event.cache_creation_tokens, 2);
+        assert_eq!(event.cache_read_tokens, 3);
+        assert!((event.total_cost.unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!(!format!("{scan:?}").contains("DO_NOT_RETAIN_SENTINEL"));
+        assert!(!scan.sources[0].feasibility.durable_capture_allowed);
+        assert!(
+            scan.sources[0]
+                .feasibility
+                .blockers
+                .contains(&DetailedCaptureBlocker::AuthoritativeCorrectionOrderUnavailable)
+        );
+    }
+
+    #[test]
+    fn detailed_codex_events_expose_cumulative_deltas_ambiguous_decreases_and_missing_identity() {
+        let fixture = fs_fixture!({
+            "session.jsonl": [
+                codex_cumulative("2026-01-10T10:00:00.000Z", 100, 20, 10),
+                codex_cumulative("2026-01-10T10:01:00.000Z", 160, 30, 25),
+                codex_cumulative("2026-01-10T10:02:00.000Z", 40, 5, 30),
+            ].join("\n"),
+        });
+        let opts = DetailedUsageOptions {
+            capture_permission: DetailedCapturePermission::Granted,
+            claude_dirs: Vec::new(),
+            codex_session_dirs: vec![fixture.root().to_path_buf()],
+            max_source_bytes: 1024 * 1024,
+            max_source_files: 10,
+            max_directory_depth: 8,
+            max_discovery_entries: 100,
+            max_events: 10,
+        };
+
+        let scan = detailed_usage_events(&opts).unwrap();
+
+        assert_eq!(scan.events.len(), 3);
+        assert!(
+            scan.events
+                .iter()
+                .all(|event| event.provider_event_id.is_none())
+        );
+        assert_eq!(
+            scan.events[0].counter_mode,
+            DetailedCounterMode::CumulativeDelta
+        );
+        assert_eq!(scan.events[0].counter_epoch, 0);
+        assert_eq!(scan.events[1].input_tokens, 50);
+        assert_eq!(scan.events[1].cache_read_tokens, 10);
+        assert_eq!(
+            scan.events[1].counter_mode,
+            DetailedCounterMode::CumulativeDelta
+        );
+        assert_eq!(scan.events[1].counter_epoch, 0);
+        assert_eq!(scan.events[2].input_tokens, 0);
+        assert_eq!(scan.events[2].cache_read_tokens, 0);
+        assert_eq!(scan.events[2].output_tokens, 5);
+        assert_eq!(
+            scan.events[2].counter_mode,
+            DetailedCounterMode::CumulativeDecreaseAmbiguous
+        );
+        assert_eq!(scan.events[2].counter_epoch, 0);
+        assert!(!scan.sources[1].feasibility.durable_capture_allowed);
+        assert!(
+            scan.sources[1]
+                .feasibility
+                .blockers
+                .contains(&DetailedCaptureBlocker::ProviderEventIdentityUnavailable)
+        );
+        assert!(
+            scan.sources[1]
+                .feasibility
+                .blockers
+                .contains(&DetailedCaptureBlocker::CumulativeResetVsCorrectionAmbiguous)
+        );
+    }
+
+    #[test]
+    fn detailed_scan_rejects_sources_over_the_byte_limit_before_parsing() {
+        let fixture = fs_fixture!({
+            "projects/proj-a/session.jsonl": entry(
+                "2026-01-10T10:00:00.000Z",
+                "m1",
+                "r1",
+                "claude-opus-4-6",
+                100,
+                0.5,
+            ),
+        });
+        let opts = DetailedUsageOptions {
+            capture_permission: DetailedCapturePermission::Granted,
+            claude_dirs: vec![fixture.root().to_path_buf()],
+            codex_session_dirs: Vec::new(),
+            max_source_bytes: 1,
+            max_source_files: 10,
+            max_directory_depth: 8,
+            max_discovery_entries: 100,
+            max_events: 10,
+        };
+
+        let error = detailed_usage_events(&opts).unwrap_err();
+
+        assert!(error.to_string().contains("source byte limit"));
+    }
+
+    #[test]
+    fn detailed_scan_requires_capture_permission_before_discovery() {
+        let opts = DetailedUsageOptions {
+            capture_permission: DetailedCapturePermission::Denied,
+            claude_dirs: vec![PathBuf::from("/definitely/not/a/provider/root")],
+            codex_session_dirs: vec![PathBuf::from("/also/not/a/provider/root")],
+            max_source_bytes: u64::MAX,
+            max_source_files: usize::MAX,
+            max_directory_depth: usize::MAX,
+            max_discovery_entries: usize::MAX,
+            max_events: usize::MAX,
+        };
+
+        let error = detailed_usage_events(&opts).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("permission has not been granted")
+        );
+    }
+
+    #[test]
+    fn detailed_claude_correction_replaces_event_and_changes_revision() {
+        let original = fs_fixture!({
+            "projects/proj-a/session.jsonl": entry(
+                "2026-01-10T10:00:00.000Z",
+                "m1",
+                "r1",
+                "claude-opus-4-6",
+                100,
+                0.5,
+            ),
+        });
+        let corrected = fs_fixture!({
+            "projects/proj-a/session.jsonl": [
+                entry(
+                    "2026-01-10T10:00:00.000Z",
+                    "m1",
+                    "r1",
+                    "claude-opus-4-6",
+                    100,
+                    0.5,
+                ),
+                entry(
+                    "2026-01-10T10:00:00.000Z",
+                    "m1",
+                    "r1",
+                    "claude-opus-4-6",
+                    200,
+                    0.75,
+                ),
+            ].join("\n"),
+        });
+        let scan = |root: &std::path::Path| {
+            detailed_usage_events(&DetailedUsageOptions {
+                capture_permission: DetailedCapturePermission::Granted,
+                claude_dirs: vec![root.to_path_buf()],
+                codex_session_dirs: Vec::new(),
+                max_source_bytes: 1024 * 1024,
+                max_source_files: 10,
+                max_directory_depth: 8,
+                max_discovery_entries: 100,
+                max_events: 10,
+            })
+            .unwrap()
+        };
+
+        let before = scan(original.root());
+        let after = scan(corrected.root());
+
+        assert_eq!(after.events.len(), 1);
+        assert_eq!(after.events[0].input_tokens, 200);
+        assert!((after.events[0].total_cost.unwrap() - 0.75).abs() < f64::EPSILON);
+        assert_ne!(
+            before.sources[0].source_revision,
+            after.sources[0].source_revision
+        );
+    }
+
+    #[test]
+    fn detailed_claude_token_categories_reconcile_with_aggregate_facade() {
+        let fixture = fs_fixture!({
+            "projects/proj-a/session.jsonl": [
+                entry("2026-01-10T10:00:00.000Z", "m1", "r1", "claude-opus-4-6", 100, 0.5),
+                entry("2026-01-10T10:01:00.000Z", "m2", "r2", "claude-opus-4-6", 200, 0.25),
+            ].join("\n"),
+        });
+        let scan = detailed_usage_events(&DetailedUsageOptions {
+            capture_permission: DetailedCapturePermission::Granted,
+            claude_dirs: vec![fixture.root().to_path_buf()],
+            codex_session_dirs: Vec::new(),
+            max_source_bytes: 1024 * 1024,
+            max_source_files: 10,
+            max_directory_depth: 8,
+            max_discovery_entries: 100,
+            max_events: 10,
+        })
+        .unwrap();
+        let aggregate = claude_daily(&in_dir(fixture.root())).unwrap();
+
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.input_tokens)
+                .sum::<u64>(),
+            aggregate[0].input_tokens
+        );
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.output_tokens)
+                .sum::<u64>(),
+            aggregate[0].output_tokens
+        );
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.cache_creation_tokens)
+                .sum::<u64>(),
+            aggregate[0].cache_creation_tokens
+        );
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.cache_read_tokens)
+                .sum::<u64>(),
+            aggregate[0].cache_read_tokens
+        );
+        assert!(
+            (scan
+                .events
+                .iter()
+                .filter_map(|event| event.total_cost)
+                .sum::<f64>()
+                - aggregate[0].total_cost)
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn detailed_manifest_revision_observes_downward_correction_even_when_adapter_blocks_it() {
+        let original = fs_fixture!({
+            "projects/proj-a/session.jsonl": entry(
+                "2026-01-10T10:00:00.000Z",
+                "m1",
+                "r1",
+                "claude-opus-4-6",
+                200,
+                0.75,
+            ),
+        });
+        let corrected = fs_fixture!({
+            "projects/proj-a/session.jsonl": [
+                entry("2026-01-10T10:00:00.000Z", "m1", "r1", "claude-opus-4-6", 200, 0.75),
+                entry("2026-01-10T10:00:00.000Z", "m1", "r1", "claude-opus-4-6", 100, 0.25),
+            ].join("\n"),
+        });
+        let scan = |root: &std::path::Path| {
+            detailed_usage_events(&DetailedUsageOptions {
+                capture_permission: DetailedCapturePermission::Granted,
+                claude_dirs: vec![root.to_path_buf()],
+                codex_session_dirs: Vec::new(),
+                max_source_bytes: 1024 * 1024,
+                max_source_files: 10,
+                max_directory_depth: 8,
+                max_discovery_entries: 100,
+                max_events: 10,
+            })
+            .unwrap()
+        };
+
+        let before = scan(original.root());
+        let after = scan(corrected.root());
+
+        assert_ne!(
+            before.sources[0].source_revision,
+            after.sources[0].source_revision
+        );
+        assert_eq!(after.events[0].input_tokens, 200);
+        assert!(
+            after.sources[0]
+                .feasibility
+                .blockers
+                .contains(&DetailedCaptureBlocker::AuthoritativeCorrectionOrderUnavailable)
+        );
+    }
+
+    #[test]
+    fn detailed_revision_does_not_fingerprint_message_bodies() {
+        let usage_line = |body: &str| {
+            format!(
+                r#"{{"timestamp":"2026-01-10T10:00:00.000Z","message":{{"id":"m1","model":"claude-opus-4-6","content":"{body}","usage":{{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}},"requestId":"r1","costUSD":0.5}}"#
+            )
+        };
+        let first = fs_fixture!({
+            "projects/proj-a/session.jsonl": usage_line("FIRST_PRIVATE_BODY"),
+        });
+        let second = fs_fixture!({
+            "projects/proj-a/session.jsonl": usage_line("OTHER_PRIVATE_BODY"),
+        });
+        let scan = |root: &std::path::Path| {
+            detailed_usage_events(&DetailedUsageOptions {
+                capture_permission: DetailedCapturePermission::Granted,
+                claude_dirs: vec![root.to_path_buf()],
+                codex_session_dirs: Vec::new(),
+                max_source_bytes: 1024 * 1024,
+                max_source_files: 10,
+                max_directory_depth: 8,
+                max_discovery_entries: 100,
+                max_events: 10,
+            })
+            .unwrap()
+        };
+
+        let first = scan(first.root());
+        let second = scan(second.root());
+
+        assert_eq!(
+            first.sources[0].source_revision,
+            second.sources[0].source_revision
+        );
+        assert!(!format!("{first:?}").contains("FIRST_PRIVATE_BODY"));
+        assert!(!format!("{second:?}").contains("OTHER_PRIVATE_BODY"));
+    }
+
+    #[test]
+    fn detailed_manifest_enforces_file_depth_and_event_limits() {
+        let files = fs_fixture!({
+            "projects/proj-a/a.jsonl": entry("2026-01-10T10:00:00.000Z", "m1", "r1", "claude-opus-4-6", 1, 0.1),
+            "projects/proj-a/b.jsonl": entry("2026-01-10T10:01:00.000Z", "m2", "r2", "claude-opus-4-6", 1, 0.1),
+        });
+        let options = |max_source_files, max_directory_depth, max_events| DetailedUsageOptions {
+            capture_permission: DetailedCapturePermission::Granted,
+            claude_dirs: vec![files.root().to_path_buf()],
+            codex_session_dirs: Vec::new(),
+            max_source_bytes: 1024 * 1024,
+            max_source_files,
+            max_directory_depth,
+            max_discovery_entries: 100,
+            max_events,
+        };
+
+        assert!(
+            detailed_usage_events(&options(1, 8, 10))
+                .unwrap_err()
+                .to_string()
+                .contains("file limit")
+        );
+        assert!(
+            detailed_usage_events(&options(10, 0, 10))
+                .unwrap_err()
+                .to_string()
+                .contains("depth limit")
+        );
+        assert!(
+            detailed_usage_events(&options(10, 8, 1))
+                .unwrap_err()
+                .to_string()
+                .contains("event limit")
+        );
+    }
+
+    #[test]
+    fn detailed_manifest_bounds_wide_irrelevant_discovery() {
+        let fixture = fs_fixture!({
+            "projects/empty-a/.keep": "",
+            "projects/empty-b/.keep": "",
+            "projects/empty-c/.keep": "",
+            "projects/readme.txt": "not usage",
+        });
+        let opts = DetailedUsageOptions {
+            capture_permission: DetailedCapturePermission::Granted,
+            claude_dirs: vec![fixture.root().to_path_buf()],
+            codex_session_dirs: Vec::new(),
+            max_source_bytes: 1024 * 1024,
+            max_source_files: 10,
+            max_directory_depth: 8,
+            max_discovery_entries: 3,
+            max_events: 10,
+        };
+
+        let error = detailed_usage_events(&opts).unwrap_err();
+
+        assert!(error.to_string().contains("discovery entry limit"));
+    }
+
+    #[test]
+    fn detailed_codex_scan_does_not_tuple_dedupe_distinct_sessions() {
+        let line = codex_cumulative("2026-01-10T10:00:00.000Z", 100, 20, 10);
+        let fixture = fs_fixture!({
+            "session-a.jsonl": line.clone(),
+            "session-b.jsonl": line,
+        });
+
+        let scan = detailed_usage_events(&DetailedUsageOptions {
+            capture_permission: DetailedCapturePermission::Granted,
+            claude_dirs: Vec::new(),
+            codex_session_dirs: vec![fixture.root().to_path_buf()],
+            max_source_bytes: 1024 * 1024,
+            max_source_files: 10,
+            max_directory_depth: 8,
+            max_discovery_entries: 100,
+            max_events: 10,
+        })
+        .unwrap();
+
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(scan.events[0].session_id, "session-a");
+        assert_eq!(scan.events[1].session_id, "session-b");
     }
 
     #[test]
