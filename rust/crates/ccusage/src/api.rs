@@ -831,6 +831,26 @@ mod tests {
     }
 
     #[test]
+    fn embedded_price_quote_prices_claude_sonnet_5_with_published_cache_rates() {
+        let quote = quote_embedded_tokens(&TokenPriceRequest {
+            model: "claude-sonnet-5".to_owned(),
+            input_tokens: 1_000_000,
+            cached_input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_creation_input_tokens: 1_000_000,
+        });
+
+        assert_eq!(quote.requested_model, "claude-sonnet-5");
+        assert_eq!(quote.resolved_model, "claude-sonnet-5");
+        assert!(!quote.missing_pricing);
+        assert!(
+            quote
+                .estimated_cost_usd
+                .is_some_and(|cost| (cost - 14.7).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
     fn embedded_price_quote_marks_unknown_model_missing_instead_of_zero_cost() {
         let quote = quote_embedded_tokens(&TokenPriceRequest {
             model: "provider/definitely-unknown-model".to_owned(),
