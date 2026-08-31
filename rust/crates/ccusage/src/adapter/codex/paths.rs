@@ -17,7 +17,7 @@ fn codex_usage_paths_from_homes(homes: Vec<PathBuf>) -> Vec<PathBuf> {
         .collect()
 }
 
-fn codex_usage_sources_from_homes(homes: Vec<PathBuf>) -> Vec<CodexUsageSource> {
+pub(super) fn codex_usage_sources_from_homes(homes: Vec<PathBuf>) -> Vec<CodexUsageSource> {
     let mut paths = Vec::new();
     let mut seen = FxHashSet::default();
     for path in homes {

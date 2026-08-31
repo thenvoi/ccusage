@@ -48,6 +48,17 @@ pub(crate) fn load_groups(
     load_groups_from_sources(&sources, shared, kind)
 }
 
+pub(crate) fn load_groups_with_additional_homes(
+    additional_homes: &[PathBuf],
+    shared: &SharedArgs,
+    kind: AgentReportKind,
+) -> Result<BTreeMap<String, CodexGroup>> {
+    let mut homes = paths::codex_home_paths()?;
+    homes.extend_from_slice(additional_homes);
+    let sources = paths::codex_usage_sources_from_homes(homes);
+    load_groups_from_sources(&sources, shared, kind)
+}
+
 fn load_groups_from_sources(
     sources: &[paths::CodexUsageSource],
     shared: &SharedArgs,

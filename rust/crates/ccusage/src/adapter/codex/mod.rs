@@ -8,7 +8,9 @@ mod types;
 
 use crate::{PricingMap, Result, cli::AgentCommandArgs, log_level, print_json_or_jq, wants_json};
 
-pub(crate) use aggregate::{aggregate_events, filter_events_by_date, load_groups};
+pub(crate) use aggregate::{
+    aggregate_events, filter_events_by_date, load_groups, load_groups_with_additional_homes,
+};
 pub(crate) use loader::load_codex_events;
 #[cfg(test)]
 pub(crate) use loader::load_codex_events_from_directory;
