@@ -22,13 +22,15 @@ Upstream ships the crate **binary-only** — no `[lib]` target, every type
 ## Changes, newest first (what · why)
 
 ### 6. Claude Sonnet 5 pricing backport
-**What:** Added the exact `claude-sonnet-5` entry to the embedded pricing
-catalog, with a public API regression covering input, cache-write, cache-read,
-and output prices.
+**What:** Added one reviewed exact `claude-sonnet-5` entry to the compact
+build-time catalog and the models.dev fallback, with a public API regression
+covering input, cache-write, cache-read, and output prices.
 **Why:** Current Claude Code sessions report this model name, while the
-v20.0.17 catalog embedded by this facade predates it. Upstream v20.0.20 already
-contains the entry; this focused backport keeps the fork's existing model-match
-semantics unchanged until the facade is rebased onto that release.
+v20.0.17 catalogs embedded by this facade predate it. Upstream v20.0.20 already
+contains the data. The exact reviewed build-time backport keeps the fork's
+existing model-match semantics unchanged until the facade is rebased onto that
+release, regardless of whether a downstream build supplies its own pinned
+LiteLLM snapshot through `CCUSAGE_PRICING_JSON_PATH`.
 
 ### 5. `license = "MIT"` declared on all four crates (`1fa488b`)
 **What:** Added the `license` field to `ccusage`, `ccusage-cli`,
