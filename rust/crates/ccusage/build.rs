@@ -145,7 +145,22 @@ fn compact_pricing_json(json: &str) -> Option<String> {
             compact.insert(model, Value::Object(fields));
         }
     }
+    insert_reviewed_pricing_backports(&mut compact);
     serde_json::to_string(&Value::Object(compact)).ok()
+}
+
+fn insert_reviewed_pricing_backports(compact: &mut Map<String, Value>) {
+    compact
+        .entry("claude-sonnet-5".to_owned())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "i": 2.0e-6,
+                "o": 10.0e-6,
+                "cc": 2.5e-6,
+                "cr": 0.2e-6,
+                "ctx": 1_000_000
+            })
+        });
 }
 
 fn is_embedded_model(model: &str) -> bool {
