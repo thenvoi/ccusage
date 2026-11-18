@@ -21,6 +21,17 @@ Upstream ships the crate **binary-only** — no `[lib]` target, every type
 
 ## Changes, newest first (what · why)
 
+### 7. Claude Opus 5.5 and Sonnet 5.5 pricing backport
+**What:** Added reviewed exact `claude-opus-5-5` and `claude-sonnet-5-5`
+entries to the compact build-time catalog and the models.dev fallback, with one
+public API regression per model covering input, cache-write, cache-read, and
+output prices. The Opus entry carries LiteLLM's fast-mode multiplier (`2`).
+**Why:** Current Claude Code sessions report these model names, while the
+v20.0.17 catalogs embedded by this facade, and the LiteLLM snapshot pinned
+downstream, predate them. The rates are copied from upstream LiteLLM. Like the
+Sonnet 5 backport, they are inserted only when the snapshot lacks the model, so
+a newer snapshot wins, and the fork's model-match semantics stay unchanged.
+
 ### 6. Claude Sonnet 5 pricing backport
 **What:** Added one reviewed exact `claude-sonnet-5` entry to the compact
 build-time catalog and the models.dev fallback, with a public API regression

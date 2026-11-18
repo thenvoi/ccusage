@@ -161,6 +161,29 @@ fn insert_reviewed_pricing_backports(compact: &mut Map<String, Value>) {
                 "ctx": 1_000_000
             })
         });
+    compact
+        .entry("claude-opus-5-5".to_owned())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "i": 4.0e-6,
+                "o": 20.0e-6,
+                "cc": 5.0e-6,
+                "cr": 0.2e-6,
+                "ctx": 1_000_000,
+                "fast": 2.0
+            })
+        });
+    compact
+        .entry("claude-sonnet-5-5".to_owned())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "i": 2.0e-6,
+                "o": 10.0e-6,
+                "cc": 2.5e-6,
+                "cr": 0.1e-6,
+                "ctx": 1_000_000
+            })
+        });
 }
 
 fn is_embedded_model(model: &str) -> bool {
